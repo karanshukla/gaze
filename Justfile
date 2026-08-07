@@ -21,7 +21,11 @@ ort_version := env("ORT_VERSION", "1.22.0")
 
 # The opencv crate probes only the `opencv4`/`opencv` pkg-config names, so distros shipping
 # OpenCV 5 (e.g. Arch) need this override. Empty when opencv4/opencv resolve or opencv5 doesn't.
-opencv_env := shell("pkg-config --exists opencv4 2>/dev/null || pkg-config --exists opencv 2>/dev/null || ! pkg-config --exists opencv5 2>/dev/null || echo OPENCV_PKGCONFIG_NAME=opencv5")
+#
+# A local header sysroot (`just fetch-opencv-headers`) takes precedence over both, which is how
+# a Fedora host builds without installing opencv-devel and its 751 MiB of VTK/OpenCascade
+# dependencies. See scripts/opencv-headers.sh.
+opencv_env := shell("test -d .opencv-sysroot/include && exec scripts/opencv-headers.sh env; pkg-config --exists opencv4 2>/dev/null || pkg-config --exists opencv 2>/dev/null || ! pkg-config --exists opencv5 2>/dev/null || echo OPENCV_PKGCONFIG_NAME=opencv5")
 
 # Build the GTK front-end (`gaze-gui`). `GAZE_GUI=0`/`false`/`no`/`off` drops it,
 # and gtk4/libadwaita, from the build, test, and lint recipes below only.
@@ -57,6 +61,18 @@ build-rust:
 build-rust-openvino:
     {{ opencv_env }} cargo build -p gaze --release --features gaze/openvino
     {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release --features gaze-cli/openvino{{ gui_feature }}
+
+# Fetch a minimal OpenCV header sysroot so the build does not need opencv-devel
+# (which pulls VTK and OpenCascade on Fedora). Needs opencv-core and
+# opencv-imgproc installed; every build recipe picks the sysroot up automatically.
+[group("build")]
+fetch-opencv-headers:
+    scripts/opencv-headers.sh setup
+
+# Remove the local OpenCV header sysroot
+[group("build")]
+clean-opencv-headers:
+    scripts/opencv-headers.sh clean
 
 # Compile the SELinux policy module
 [group("build")]

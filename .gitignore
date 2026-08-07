@@ -29,3 +29,6 @@ docs/archive/
 result
 result-*
 references/
+
+# Local OpenCV header sysroot (just fetch-opencv-headers)
+.opencv-sysroot/
