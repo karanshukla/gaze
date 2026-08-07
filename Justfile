@@ -27,6 +27,16 @@ ort_version := env("ORT_VERSION", "1.22.0")
 # dependencies. See scripts/opencv-headers.sh.
 opencv_env := shell("test -d .opencv-sysroot/include && exec scripts/opencv-headers.sh env; pkg-config --exists opencv4 2>/dev/null || pkg-config --exists opencv 2>/dev/null || ! pkg-config --exists opencv5 2>/dev/null || echo OPENCV_PKGCONFIG_NAME=opencv5")
 
+# OpenVINO builds link against a self-supplied ONNX Runtime rather than a
+# downloaded one, so point ort-sys at it and give gazed an rpath to find it at
+# runtime. The rpath must live outside /home: gazed.service runs under
+# ProtectSystem=strict with InaccessiblePaths=/home, so a lib tree under $HOME
+# resolves for manual test runs but not for the real service.
+# Empty (no override) when the directory has no ONNX Runtime, which leaves
+# ort-sys to its own resolution.
+ort_lib_dir := env("ORT_LIB_DIR", "/usr/lib64/gaze")
+ort_env := shell("test -e \"$1/libonnxruntime.so\" && echo ORT_LIB_PATH=\"$1\" ORT_PREFER_DYNAMIC_LINK=1 RUSTFLAGS=-Clink-arg=-Wl,-rpath,\"$1\"", ort_lib_dir)
+
 # Build the GTK front-end (`gaze-gui`). `GAZE_GUI=0`/`false`/`no`/`off` drops it,
 # and gtk4/libadwaita, from the build, test, and lint recipes below only.
 gui := lowercase(env("GAZE_GUI", "1"))
@@ -53,13 +63,13 @@ default:
 # Build all Rust workspace binaries (release)
 [group("build")]
 build-rust:
-    {{ opencv_env }} cargo build -p gaze --release
+    {{ opencv_env }} {{ ort_env }} cargo build -p gaze --release
     {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release
 
 # Build all Rust workspace binaries with OpenVINO configuration and runtime support.
 [group("build")]
 build-rust-openvino:
-    {{ opencv_env }} cargo build -p gaze --release --features gaze/openvino
+    {{ opencv_env }} {{ ort_env }} cargo build -p gaze --release --features gaze/openvino
     {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release --features gaze-cli/openvino{{ gui_feature }}
 
 # Fetch a minimal OpenCV header sysroot so the build does not need opencv-devel
@@ -435,13 +445,13 @@ setup-hooks:
 [group("checks")]
 test:
     @{{ gui_notice }}
-    {{ opencv_env }} cargo test --workspace {{ gui_exclude }} --release
+    {{ opencv_env }} {{ ort_env }} cargo test --workspace {{ gui_exclude }} --release
     {{ opencv_env }} cargo test -p gaze-core --release --no-default-features --features gaze-core/openvino-config config::
 
 # Run the OpenVINO-gated tests with an OpenVINO-enabled system ONNX Runtime.
 [group("checks")]
 test-openvino:
-    {{ opencv_env }} cargo test -p gaze-core --release --features gaze-core/openvino -- inference:: config::
+    {{ opencv_env }} {{ ort_env }} cargo test -p gaze-core --release --features gaze-core/openvino -- inference:: config::
 
 # Check dependencies for known security advisories
 [group("checks")]
@@ -452,12 +462,12 @@ audit:
 [group("checks")]
 lint:
     @{{ gui_notice }}
-    {{ opencv_env }} cargo clippy --workspace {{ gui_exclude }} --all-targets -- -D warnings
+    {{ opencv_env }} {{ ort_env }} cargo clippy --workspace {{ gui_exclude }} --all-targets -- -D warnings
 
 # Lint the OpenVINO-gated code with an OpenVINO-enabled system ONNX Runtime.
 [group("checks")]
 lint-openvino:
-    {{ opencv_env }} cargo clippy -p gaze-core --all-targets --features gaze-core/openvino -- -D warnings
+    {{ opencv_env }} {{ ort_env }} cargo clippy -p gaze-core --all-targets --features gaze-core/openvino -- -D warnings
 
 # Check formatting (does not write)
 [group("checks")]
