@@ -235,7 +235,8 @@ install, and `GAZE_GUI=0` to keep the GUI out.
 - Links `/usr/bin/gazed`, `/usr/bin/gaze`, the PAM modules, the polkit policy, and the GNOME
   extension (system-wide and current-user) over the package-installed files. `/usr/bin/gaze-gui`
   is linked too when the build produced it, and skipped after a `GAZE_GUI=0` build.
-- Adds a `pam_gaze.so` line to `/etc/pam.d/sudo` if one isn't already there.
+- Adds a `pam_gaze.so` line to `/etc/pam.d/sudo`, unless `sudo` already reaches the module —
+  either directly or through a stack it includes, such as an authselect-managed `system-auth`.
 - Installs a systemd drop-in for `gazed` that clears `InaccessiblePaths=/home /root` so the
   packaged unit can execute a binary linked from your checkout, then restarts `gazed`.
 - If a TPM is present, turns on `[storage] encrypt_templates` and seals a key to it (set
