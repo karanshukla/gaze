@@ -46,6 +46,13 @@ gui_feature := if gui_off == "1" { "" } else { ",gaze-gui/openvino" }
 gui_exclude := if gui_off == "1" { "--exclude gaze-gui" } else { "" }
 gui_notice := if gui_off == "1" { "echo 'note: GAZE_GUI is off, gaze-gui is excluded here; CI still checks it'" } else { "true" }
 
+# Build the OpenVINO execution provider. `GAZE_OPENVINO=1`/`true`/`yes`/`on` adds it to
+# `build-rust`, so recipes that depend on it install what you asked for rather than a CPU build.
+ov := lowercase(env("GAZE_OPENVINO", "0"))
+ov_on := if ov =~ '^(1|true|yes|on)$' { "1" } else { "" }
+ov_daemon := if ov_on == "1" { "--features gaze/openvino" } else { "" }
+ov_client := if ov_on == "1" { "--features gaze-cli/openvino" + gui_feature } else { "" }
+
 # Derived vars
 multiarch := if arch == "aarch64" { "aarch64-linux-gnu" } else { "x86_64-linux-gnu" }
 deb_arch := if arch == "x86_64" { "amd64" } else if arch == "aarch64" { "arm64" } else { arch }
@@ -63,14 +70,13 @@ default:
 # Build all Rust workspace binaries (release)
 [group("build")]
 build-rust:
-    {{ opencv_env }} {{ ort_env }} cargo build -p gaze --release
-    {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release
+    {{ opencv_env }} {{ ort_env }} cargo build -p gaze --release {{ ov_daemon }}
+    {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release {{ ov_client }}
 
 # Build all Rust workspace binaries with OpenVINO configuration and runtime support.
 [group("build")]
 build-rust-openvino:
-    {{ opencv_env }} {{ ort_env }} cargo build -p gaze --release --features gaze/openvino
-    {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release --features gaze-cli/openvino{{ gui_feature }}
+    @GAZE_OPENVINO=1 {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} build-rust
 
 # Fetch a minimal OpenCV header sysroot so the build does not need opencv-devel
 # (which pulls VTK and OpenCascade on Fedora). Needs opencv-core and

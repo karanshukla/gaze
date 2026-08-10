@@ -100,6 +100,14 @@ build`/`cargo test` still builds every workspace member, and the packaging paths
 (`package`, `build-flatpak`, and the spec `srpm` feeds) always include the GUI,
 so building packages still needs the GUI dependencies installed.
 
+OpenVINO is off by default. Set `GAZE_OPENVINO=1` (also `true`, `yes`, or `on`)
+to add it to `build-rust`, which is all `build-rust-openvino` now does. This
+matters for recipes that build first: `dev-link-system` and `package` depend on
+`build-rust`, so without the variable they link and package a CPU-only build
+even if you ran `build-rust-openvino` yourself beforehand. `test-openvino` and
+`lint-openvino` stay separate, since they also need an OpenVINO-enabled system
+ONNX Runtime.
+
 ## Setup
 
 ```bash
@@ -217,6 +225,10 @@ or the `deb`/`archlinux` equivalent); `dev-link-system` fails fast with a pointe
 just build-rust
 just dev-link-system    # runs scripts/dev-link-system.sh under sudo itself
 ```
+
+`dev-link-system` rebuilds through `build-rust` before linking, so pass the same
+variables you build with — `GAZE_OPENVINO=1 just dev-link-system` for an OpenVINO
+install, and `GAZE_GUI=0` to keep the GUI out.
 
 `dev-link-system` (`scripts/dev-link-system.sh enable`) does more than swap binaries:
 
