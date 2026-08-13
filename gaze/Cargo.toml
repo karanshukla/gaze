@@ -50,3 +50,7 @@ tss-esapi = "7.7.0"
 [[bin]]
 name = "gazed"
 path = "src/main.rs"
+
+[[bin]]
+name = "face-benchmark"
+path = "src/bin/face_benchmark.rs"
