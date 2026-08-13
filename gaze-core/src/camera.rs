@@ -38,6 +38,8 @@ pub struct ConfiguredCameraSources {
     pub rgb: String,
     pub ir: String,
     pub ir_node: String,
+    /// Whether hybrid verification has to capture RGB and IR one spectrum at a time.
+    pub serial_capture: bool,
 }
 
 pub fn resolve_ir_source(cameras: &CameraConfig) -> Option<(String, String)> {
@@ -62,7 +64,34 @@ pub fn resolve_rgb_source(cameras: &CameraConfig) -> Option<String> {
 pub fn resolve_configured_sources(cameras: &CameraConfig) -> ConfiguredCameraSources {
     let rgb = resolve_rgb_source(cameras).unwrap_or_default();
     let (ir, ir_node) = resolve_ir_source(cameras).unwrap_or_default();
-    ConfiguredCameraSources { rgb, ir, ir_node }
+    // The RGB side needs its own colour-aware lookup: one `usb:VVVV:PPPP` spec can name both a
+    // colour and a mono node, and `resolve_ir_source` only ever asks for the mono one.
+    let rgb_node = resolve_node_for(&rgb, true);
+    let serial_capture = capture_must_serialize(rgb_node.as_deref(), non_empty(&ir_node));
+    ConfiguredCameraSources {
+        rgb,
+        ir,
+        ir_node,
+        serial_capture,
+    }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+/// Whether hybrid verification must run RGB and IR sequentially rather than concurrently.
+///
+/// Single-function UVC modules (e.g. the Logitech Brio) expose both spectra through one V4L2
+/// node that streams only one mode at a time, so opening IR while RGB holds the device fails.
+/// Two distinct nodes are independent streams and can capture at once. A source that resolves
+/// to no node at all — a bare PipeWire `primary`, a hand-written GStreamer pipeline — is treated
+/// as shared, keeping the conservative serial behaviour rather than guessing.
+fn capture_must_serialize(rgb_node: Option<&str>, ir_node: Option<&str>) -> bool {
+    match (rgb_node, ir_node) {
+        (Some(rgb), Some(ir)) => rgb == ir,
+        _ => true,
+    }
 }
 
 pub fn preferred_capture_source(cameras: &CameraConfig) -> (String, bool) {
@@ -92,13 +121,20 @@ fn is_pipewire_source(source: &str) -> bool {
 }
 
 pub fn resolve_node(source: &str) -> Option<String> {
+    resolve_node_for(source, false)
+}
+
+/// Resolve a configured source to its V4L2 node. `want_color` only matters for `usb:VVVV:PPPP`
+/// specs, where a single VID:PID can advertise both a colour and a mono node; the other forms
+/// already name one node outright.
+pub fn resolve_node_for(source: &str, want_color: bool) -> Option<String> {
     let source = source.trim();
     if source.is_empty() {
         return None;
     }
 
     if let Some((vid, pid)) = parse_usb_spec(source) {
-        return resolve_usb_video_node(vid, pid, false);
+        return resolve_usb_video_node(vid, pid, want_color);
     }
 
     if let Some(pos) = source.find("/dev/video") {
@@ -135,7 +171,7 @@ pub fn resolve_node(source: &str) -> Option<String> {
 
     // Without a PipeWire session the target names no device the monitor saw, but udev still
     // links the node it was named after.
-    node_from_pipewire_target(target, false)
+    node_from_pipewire_target(target, want_color)
 }
 
 /// A GStreamer source element, or a request to resolve a USB VID:PID to a
@@ -1545,6 +1581,36 @@ mod tests {
         let sources = resolve_configured_sources(&cameras);
         assert_eq!(sources.ir, "pipewiresrc target-object=device-name");
         assert_eq!(sources.ir_node, "");
+        assert!(
+            sources.serial_capture,
+            "an unresolvable node must keep the safe serial capture path"
+        );
+    }
+
+    #[test]
+    fn distinct_capture_nodes_may_stream_concurrently() {
+        assert!(!capture_must_serialize(
+            Some("/dev/video0"),
+            Some("/dev/video2")
+        ));
+    }
+
+    #[test]
+    fn a_shared_capture_node_must_stream_one_spectrum_at_a_time() {
+        // Single-function Windows Hello modules resolve both spectra to the same node.
+        assert!(capture_must_serialize(
+            Some("/dev/video0"),
+            Some("/dev/video0")
+        ));
+    }
+
+    #[test]
+    fn an_unresolvable_capture_node_falls_back_to_serial() {
+        // A bare PipeWire `primary` or a custom pipeline names no node, so the safe
+        // assumption is that it might be the very device IR is about to open.
+        assert!(capture_must_serialize(None, Some("/dev/video2")));
+        assert!(capture_must_serialize(Some("/dev/video0"), None));
+        assert!(capture_must_serialize(None, None));
     }
 
     #[test]

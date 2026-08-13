@@ -166,6 +166,20 @@ async fn main() -> anyhow::Result<()> {
     warn_on_ir_misconfig(&config.cameras);
 
     let sources = gaze_core::camera::resolve_configured_sources(&config.cameras);
+    if !sources.ir.is_empty() {
+        info!(
+            rgb = sources.rgb,
+            ir = sources.ir,
+            ir_node = sources.ir_node,
+            serial_capture = sources.serial_capture,
+            "Resolved camera sources; hybrid verify captures {}",
+            if sources.serial_capture {
+                "RGB then IR (shared or unresolvable node)"
+            } else {
+                "RGB and IR concurrently"
+            }
+        );
+    }
 
     let resume_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lock_epochs: daemon::LockEpochs = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -183,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
         rgb_device: Arc::new(Mutex::new(sources.rgb)),
         ir_device: Arc::new(Mutex::new(sources.ir)),
         ir_node: Arc::new(Mutex::new(sources.ir_node)),
+        serial_capture: Arc::new(Mutex::new(sources.serial_capture)),
         emitter_enabled: Arc::new(Mutex::new(config.cameras.emitter_enabled)),
         liveness_config: Arc::new(Mutex::new(config.liveness.clone())),
         hybrid_policy: Arc::new(Mutex::new(security.hybrid_policy().to_string())),
