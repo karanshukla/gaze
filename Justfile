@@ -90,17 +90,20 @@ fetch-opencv-headers:
 clean-opencv-headers:
     scripts/opencv-headers.sh clean
 
-# Compile the SELinux policy module
+# Compile the SELinux policy modules
 [group("build")]
 build-selinux:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p dist/selinux
     if command -v checkmodule >/dev/null 2>&1 && command -v semodule_package >/dev/null 2>&1; then
-        checkmodule -M -m -o dist/selinux/gaze-gdm-camera.mod packaging/selinux/gaze-gdm-camera.te
-        semodule_package -o dist/selinux/gaze-gdm-camera.pp -m dist/selinux/gaze-gdm-camera.mod
-        rm -f dist/selinux/gaze-gdm-camera.mod
-        echo "Built dist/selinux/gaze-gdm-camera.pp"
+        for te in packaging/selinux/*.te; do
+            name=$(basename "$te" .te)
+            checkmodule -M -m -o "dist/selinux/$name.mod" "$te"
+            semodule_package -o "dist/selinux/$name.pp" -m "dist/selinux/$name.mod"
+            rm -f "dist/selinux/$name.mod"
+            echo "Built dist/selinux/$name.pp"
+        done
     else
         echo "WARNING: SELinux tools not found. Skipping SELinux policy build." >&2
     fi
