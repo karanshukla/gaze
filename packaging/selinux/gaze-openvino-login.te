@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Gundu Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+module gaze-openvino-login 1.0;
+
+# Only needed for OpenVINO builds. The OpenVINO runtime brings oneTBB in with it, and
+# linking it into gaze-core puts it in pam_gaze too, even though the module only talks
+# to gazed over D-Bus and runs no inference itself. TBB's scalable allocator probes
+# /proc/sys/vm/nr_hugepages when it initialises, so a TTY login trips a denial:
+#
+#   avc: denied { read } comm="login" name="nr_hugepages"
+#   scontext=system_u:system_r:local_login_t tcontext=system_u:object_r:sysctl_vm_t
+#
+# TBB reads the failure as "no huge pages" and uses ordinary ones, so authentication is
+# unaffected and nothing needs the access. Silence the probe rather than allow it: a read
+# on sysctl_vm_t would widen the login domain and buy nothing.
+
+require {
+    type local_login_t;
+    type sysctl_vm_t;
+    class file read;
+}
+
+dontaudit local_login_t sysctl_vm_t:file read;

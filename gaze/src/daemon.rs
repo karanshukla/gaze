@@ -235,6 +235,8 @@ pub struct AuthDaemon {
     pub rgb_device: Arc<Mutex<String>>,
     pub ir_device: Arc<Mutex<String>>,
     pub ir_node: Arc<Mutex<String>>,
+    /// Set when RGB and IR share one V4L2 node and must therefore capture one at a time.
+    pub serial_capture: Arc<Mutex<bool>>,
     pub emitter_enabled: Arc<Mutex<bool>>,
     pub liveness_config: Arc<Mutex<gaze_core::config::LivenessConfig>>,
     pub hybrid_policy: Arc<Mutex<String>>,
@@ -754,8 +756,8 @@ mod tests {
     use super::{
         AuthDaemon, CameraBinding, ClaimState, ClaimStateHandle, and_policy_unsatisfiable,
         auth_streams, bind_pipewire_session_for_uid, claim_has_epoch, clear_pipewire_session,
-        eyes_from_kpss, hybrid_auth_passed, is_vanish_of, release_claim_epoch,
-        should_yield_rgb_to_ir,
+        eyes_from_kpss, hybrid_auth_passed, ir_waits_for_rgb, is_vanish_of, release_claim_epoch,
+        rgb_yields_camera_on_budget, should_yield_rgb_to_ir,
     };
     use gaze_core::config::AuthSurface;
     use gaze_core::dbus::{ActiveSession, CaptureStatus};
@@ -1572,6 +1574,62 @@ mod tests {
     }
 
     #[test]
+    fn independent_camera_nodes_capture_both_spectra_at_once() {
+        // Two nodes (e.g. /dev/video0 colour + /dev/video2 mono): neither phase blocks
+        // on the other, so hybrid verify costs max(rgb, ir) instead of rgb + ir.
+        assert!(!ir_waits_for_rgb(true, false));
+        assert!(!rgb_yields_camera_on_budget(true, false));
+    }
+
+    #[test]
+    fn a_shared_camera_node_still_serializes_the_two_phases() {
+        // Single-function UVC devices can only stream one mode at a time, so the
+        // handshake that lets IR take the camera after RGB must stay intact.
+        assert!(ir_waits_for_rgb(true, true));
+        assert!(rgb_yields_camera_on_budget(true, true));
+    }
+
+    #[test]
+    fn a_lone_spectrum_never_waits_on_the_other() {
+        for serial_capture in [true, false] {
+            assert!(!ir_waits_for_rgb(false, serial_capture), "{serial_capture}");
+            assert!(
+                !rgb_yields_camera_on_budget(false, serial_capture),
+                "{serial_capture}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_capture_does_not_weaken_the_and_policy() {
+        // Concurrency changes only when each spectrum is captured, never whether both
+        // still have to pass, so "and" must keep rejecting every single-spectrum result.
+        for (rgb_success, ir_success) in [(true, false), (false, true), (false, false)] {
+            assert!(
+                !hybrid_auth_passed(
+                    "and",
+                    true,
+                    true,
+                    true,
+                    CaptureStatus::Usable,
+                    rgb_success,
+                    ir_success
+                ),
+                "{rgb_success} {ir_success}"
+            );
+        }
+        assert!(hybrid_auth_passed(
+            "and",
+            true,
+            true,
+            true,
+            CaptureStatus::Usable,
+            true,
+            true
+        ));
+    }
+
+    #[test]
     fn and_policy_refuses_to_degrade_to_one_spectrum() {
         let (run_rgb, run_ir) = auth_streams("primary", "/dev/video2", true, false);
         assert!(and_policy_unsatisfiable(
@@ -1968,6 +2026,18 @@ fn verify_give_up(since_face: Duration, since_usable: Duration) -> Option<Verify
         return Some(VerifyGiveUp::NoUsableFrame);
     }
     None
+}
+
+/// Whether the IR phase has to wait for RGB to release the camera before opening its stream.
+/// Only true when both spectra share one V4L2 node; independent nodes stream side by side.
+fn ir_waits_for_rgb(run_rgb: bool, serial_capture: bool) -> bool {
+    run_rgb && serial_capture
+}
+
+/// Whether the RGB phase must surrender the camera on a time budget so IR can capture at all.
+/// Pointless on independent nodes, where IR already has a stream of its own.
+fn rgb_yields_camera_on_budget(run_ir: bool, serial_capture: bool) -> bool {
+    run_ir && serial_capture
 }
 
 fn hybrid_auth_passed(
@@ -3315,6 +3385,7 @@ impl AuthDaemon {
         *self.rgb_device.lock().await = sources.rgb;
         *self.ir_device.lock().await = sources.ir;
         *self.ir_node.lock().await = sources.ir_node;
+        *self.serial_capture.lock().await = sources.serial_capture;
         *self.emitter_enabled.lock().await = new_config.cameras.emitter_enabled;
 
         let mut live_cfg = self.liveness_config.lock().await;
@@ -3585,6 +3656,7 @@ impl AuthDaemon {
         }
         let liveness_cfg = self.liveness_config.lock().await.clone();
         let hybrid_policy = self.hybrid_policy.lock().await.clone();
+        let serial_capture = *self.serial_capture.lock().await;
         let conn = ctxt.connection().clone();
         let path = ctxt.path().to_owned();
 
@@ -3664,10 +3736,16 @@ impl AuthDaemon {
                 username
             );
 
+            info!(
+                serial_capture,
+                run_rgb, run_ir, "VerifyStart: hybrid capture mode"
+            );
+
             let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<VerifyMsg>(10);
             let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // Signals that the RGB phase released its camera so the IR thread can take it,
             // letting single-function UVC devices (e.g. Logitech Brio) run hybrid verify.
+            // Only consulted when the two spectra share a node; distinct nodes capture at once.
             let rgb_phase_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             let mut rgb_thread = None;
@@ -3698,9 +3776,11 @@ impl AuthDaemon {
                         }
                     }
                     let _rgb_phase_guard = RgbPhaseGuard(rgb_phase_done_clone);
-                    // In serial mode (IR also runs) yield the camera after a budget even
-                    // without a match, so the IR spectrum can still be captured.
-                    let rgb_deadline = run_ir.then(|| Instant::now() + VERIFY_SERIAL_RGB_BUDGET);
+                    // In serial mode (IR also runs on the same node) yield the camera after a
+                    // budget even without a match, so the IR spectrum can still be captured.
+                    // Independent nodes are already capturing IR, so there is nothing to yield.
+                    let rgb_deadline = rgb_yields_camera_on_budget(run_ir, serial_capture)
+                        .then(|| Instant::now() + VERIFY_SERIAL_RGB_BUDGET);
                     let mut yielded_to_ir = false;
 
                     let mut cam = match Camera::open(&rgb_device_clone) {
@@ -3850,13 +3930,16 @@ impl AuthDaemon {
                 let ir_device_clone = ir_device.clone();
                 let ir_node_clone = ir_node.clone();
                 let emitter_enabled = emitter_enabled;
+                let serial_capture = serial_capture;
                 let rgb_phase_done_clone = rgb_phase_done.clone();
 
                 ir_thread = Some(std::thread::spawn(move || {
                     gaze_core::camera::bind_pipewire_uid_for_thread(pipewire_uid);
                     // Wait for RGB to release its camera before opening IR and firing the emitter,
                     // so single-function devices keep one live stream. Bail if verify passed.
-                    if run_rgb {
+                    // Skipped when the spectra live on separate nodes: there the wait only cost
+                    // latency, since both streams can be open at the same time.
+                    if ir_waits_for_rgb(run_rgb, serial_capture) {
                         while !rgb_phase_done_clone.load(std::sync::atomic::Ordering::Relaxed)
                             && !stop_clone.load(std::sync::atomic::Ordering::Relaxed)
                         {

@@ -21,7 +21,21 @@ ort_version := env("ORT_VERSION", "1.22.0")
 
 # The opencv crate probes only the `opencv4`/`opencv` pkg-config names, so distros shipping
 # OpenCV 5 (e.g. Arch) need this override. Empty when opencv4/opencv resolve or opencv5 doesn't.
-opencv_env := shell("pkg-config --exists opencv4 2>/dev/null || pkg-config --exists opencv 2>/dev/null || ! pkg-config --exists opencv5 2>/dev/null || echo OPENCV_PKGCONFIG_NAME=opencv5")
+#
+# A local header sysroot (`just fetch-opencv-headers`) takes precedence over both, which is how
+# a Fedora host builds without installing opencv-devel and its 751 MiB of VTK/OpenCascade
+# dependencies. See scripts/opencv-headers.sh.
+opencv_env := shell("test -d .opencv-sysroot/include && exec scripts/opencv-headers.sh env; pkg-config --exists opencv4 2>/dev/null || pkg-config --exists opencv 2>/dev/null || ! pkg-config --exists opencv5 2>/dev/null || echo OPENCV_PKGCONFIG_NAME=opencv5")
+
+# OpenVINO builds link against a self-supplied ONNX Runtime rather than a
+# downloaded one, so point ort-sys at it and give gazed an rpath to find it at
+# runtime. The rpath must live outside /home: gazed.service runs under
+# ProtectSystem=strict with InaccessiblePaths=/home, so a lib tree under $HOME
+# resolves for manual test runs but not for the real service.
+# Empty (no override) when the directory has no ONNX Runtime, which leaves
+# ort-sys to its own resolution.
+ort_lib_dir := env("ORT_LIB_DIR", "/usr/lib64/gaze")
+ort_env := shell("test -e \"$1/libonnxruntime.so\" && echo ORT_LIB_PATH=\"$1\" ORT_PREFER_DYNAMIC_LINK=1 RUSTFLAGS=-Clink-arg=-Wl,-rpath,\"$1\"", ort_lib_dir)
 
 # Build the GTK front-end (`gaze-gui`). `GAZE_GUI=0`/`false`/`no`/`off` drops it,
 # and gtk4/libadwaita, from the build, test, and lint recipes below only.
@@ -31,6 +45,13 @@ gui_pkg := if gui_off == "1" { "" } else { "-p gaze-gui" }
 gui_feature := if gui_off == "1" { "" } else { ",gaze-gui/openvino" }
 gui_exclude := if gui_off == "1" { "--exclude gaze-gui" } else { "" }
 gui_notice := if gui_off == "1" { "echo 'note: GAZE_GUI is off, gaze-gui is excluded here; CI still checks it'" } else { "true" }
+
+# Build the OpenVINO execution provider. `GAZE_OPENVINO=1`/`true`/`yes`/`on` adds it to
+# `build-rust`, so recipes that depend on it install what you asked for rather than a CPU build.
+ov := lowercase(env("GAZE_OPENVINO", "0"))
+ov_on := if ov =~ '^(1|true|yes|on)$' { "1" } else { "" }
+ov_daemon := if ov_on == "1" { "--features gaze/openvino" } else { "" }
+ov_client := if ov_on == "1" { "--features gaze-cli/openvino" + gui_feature } else { "" }
 
 # Derived vars
 multiarch := if arch == "aarch64" { "aarch64-linux-gnu" } else { "x86_64-linux-gnu" }
@@ -49,26 +70,40 @@ default:
 # Build all Rust workspace binaries (release)
 [group("build")]
 build-rust:
-    {{ opencv_env }} cargo build -p gaze --release
-    {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release
+    {{ opencv_env }} {{ ort_env }} cargo build -p gaze --release {{ ov_daemon }}
+    {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release {{ ov_client }}
 
 # Build all Rust workspace binaries with OpenVINO configuration and runtime support.
 [group("build")]
 build-rust-openvino:
-    {{ opencv_env }} cargo build -p gaze --release --features gaze/openvino
-    {{ opencv_env }} cargo build -p gaze-cli {{ gui_pkg }} -p pam-gaze -p pam-gaze-grosshack --release --features gaze-cli/openvino{{ gui_feature }}
+    @GAZE_OPENVINO=1 {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} build-rust
 
-# Compile the SELinux policy module
+# Fetch a minimal OpenCV header sysroot so the build does not need opencv-devel
+# (which pulls VTK and OpenCascade on Fedora). Needs opencv-core and
+# opencv-imgproc installed; every build recipe picks the sysroot up automatically.
+[group("build")]
+fetch-opencv-headers:
+    scripts/opencv-headers.sh setup
+
+# Remove the local OpenCV header sysroot
+[group("build")]
+clean-opencv-headers:
+    scripts/opencv-headers.sh clean
+
+# Compile the SELinux policy modules
 [group("build")]
 build-selinux:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p dist/selinux
     if command -v checkmodule >/dev/null 2>&1 && command -v semodule_package >/dev/null 2>&1; then
-        checkmodule -M -m -o dist/selinux/gaze-gdm-camera.mod packaging/selinux/gaze-gdm-camera.te
-        semodule_package -o dist/selinux/gaze-gdm-camera.pp -m dist/selinux/gaze-gdm-camera.mod
-        rm -f dist/selinux/gaze-gdm-camera.mod
-        echo "Built dist/selinux/gaze-gdm-camera.pp"
+        for te in packaging/selinux/*.te; do
+            name=$(basename "$te" .te)
+            checkmodule -M -m -o "dist/selinux/$name.mod" "$te"
+            semodule_package -o "dist/selinux/$name.pp" -m "dist/selinux/$name.mod"
+            rm -f "dist/selinux/$name.mod"
+            echo "Built dist/selinux/$name.pp"
+        done
     else
         echo "WARNING: SELinux tools not found. Skipping SELinux policy build." >&2
     fi
@@ -419,13 +454,13 @@ setup-hooks:
 [group("checks")]
 test:
     @{{ gui_notice }}
-    {{ opencv_env }} cargo test --workspace {{ gui_exclude }} --release
+    {{ opencv_env }} {{ ort_env }} cargo test --workspace {{ gui_exclude }} --release
     {{ opencv_env }} cargo test -p gaze-core --release --no-default-features --features gaze-core/openvino-config config::
 
 # Run the OpenVINO-gated tests with an OpenVINO-enabled system ONNX Runtime.
 [group("checks")]
 test-openvino:
-    {{ opencv_env }} cargo test -p gaze-core --release --features gaze-core/openvino -- inference:: config::
+    {{ opencv_env }} {{ ort_env }} cargo test -p gaze-core --release --features gaze-core/openvino -- inference:: config::
 
 # Check dependencies for known security advisories
 [group("checks")]
@@ -436,12 +471,12 @@ audit:
 [group("checks")]
 lint:
     @{{ gui_notice }}
-    {{ opencv_env }} cargo clippy --workspace {{ gui_exclude }} --all-targets -- -D warnings
+    {{ opencv_env }} {{ ort_env }} cargo clippy --workspace {{ gui_exclude }} --all-targets -- -D warnings
 
 # Lint the OpenVINO-gated code with an OpenVINO-enabled system ONNX Runtime.
 [group("checks")]
 lint-openvino:
-    {{ opencv_env }} cargo clippy -p gaze-core --all-targets --features gaze-core/openvino -- -D warnings
+    {{ opencv_env }} {{ ort_env }} cargo clippy -p gaze-core --all-targets --features gaze-core/openvino -- -D warnings
 
 # Check formatting (does not write)
 [group("checks")]

@@ -266,10 +266,35 @@ link_pam_modules() {
     [ "$linked" -eq 1 ] || die "Could not find a PAM security module directory."
 }
 
+# sudo usually reaches Gaze through a stack it includes rather than a line of its own: Fedora's
+# authselect puts pam_gaze.so in system-auth, and /etc/pam.d/sudo only says `include system-auth`.
+# A second line here authenticates against the same module twice, so a failed face auth pays for
+# two camera attempts before falling through to the password prompt. One level of indirection
+# covers the stacks distros actually ship.
+pam_stack_has_gaze() {
+    file=$1
+    [ -f "$file" ] || return 1
+
+    if grep -q "pam_gaze" "$file" 2>/dev/null; then
+        return 0
+    fi
+
+    for service in $(awk '$1 == "auth" && ($2 == "include" || $2 == "substack") { print $3 }' "$file" 2>/dev/null); do
+        if [ -f "/etc/pam.d/$service" ] && grep -q "pam_gaze" "/etc/pam.d/$service" 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 link_pam_config() {
     pam_file=/etc/pam.d/sudo
     [ -f "$pam_file" ] || return 0
-    grep -q "pam_gaze" "$pam_file" 2>/dev/null && { printf 'PAM already configured: %s\n' "$pam_file"; return 0; }
+    if pam_stack_has_gaze "$pam_file"; then
+        printf 'PAM already configured: %s\n' "$pam_file"
+        return 0
+    fi
 
     tmp=$(mktemp)
     awk '

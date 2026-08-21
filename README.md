@@ -255,6 +255,30 @@ just build-rust-openvino
 just package <deb | rpm | archlinux>
 ```
 
+### Building without opencv-devel (Fedora)
+
+OpenCV is used by the daemon's detection pipeline, not just the GUI, so even a
+[GUI-less build](https://gaze.gundulabs.com/guide/development) (`GAZE_GUI=0`)
+still needs its headers. On Fedora, `opencv-devel` hard-requires every OpenCV
+module — including `opencv-viz`, which pulls in VTK and OpenCascade: **123
+packages, ~751 MiB** to link two libraries.
+
+Gaze links only `opencv_core` and `opencv_imgproc`, both shipped in small
+runtime packages. `just fetch-opencv-headers` extracts the 8.9 MiB of headers
+from the `-devel` rpm without installing it, and points the link symlinks at
+those runtime libraries:
+
+```bash
+sudo dnf install opencv-core opencv-imgproc   # runtime libs, ~10 MiB
+just fetch-opencv-headers                     # headers only, no dependencies
+GAZE_GUI=0 just build-rust-openvino
+```
+
+Every build recipe picks the sysroot up automatically once it exists, and falls
+back to the normal pkg-config probe when it does not. `just clean-opencv-headers`
+removes it. Debian's `libopencv-dev` and Arch's `opencv` have no equivalent
+problem, so this is only needed on Fedora and derivatives.
+
 See the [development guide](https://gaze.gundulabs.com/guide/development) for more.
 
 ## License
