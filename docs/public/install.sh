@@ -9,6 +9,7 @@ set -e
 
 PKG_BASE_URL="https://packages.gundulabs.com"
 GNOME_DOCS_URL="https://gaze.gundulabs.com/guide/gnome"
+CINNAMON_DOCS_URL="https://gaze.gundulabs.com/guide/cinnamon"
 HYPRLAND_DOCS_URL="https://gaze.gundulabs.com/guide/hyprland"
 KDE_DOCS_URL="https://gaze.gundulabs.com/guide/kde"
 PAM_DOCS_URL="https://gaze.gundulabs.com/guide/pam"
@@ -115,8 +116,19 @@ is_kde_session() {
     return 1
 }
 
+is_cinnamon_session() {
+    case "${XDG_CURRENT_DESKTOP:-}:${XDG_SESSION_DESKTOP:-}:${DESKTOP_SESSION:-}" in
+    *X-Cinnamon* | *Cinnamon* | *cinnamon*) return 0 ;;
+    esac
+    return 1
+}
+
 want_gnome_extension_package() {
     is_gnome_session
+}
+
+want_cinnamon_extension_package() {
+    is_cinnamon_session
 }
 
 is_hyprland_session() {
@@ -137,6 +149,10 @@ want_hyprlock_setup() {
 print_manual_gnome_enable() {
     cmd "gnome-extensions enable gaze@gundulabs.com"
     cmd "gsettings set org.gnome.shell.extensions.gaze enable-face-authentication true"
+}
+
+print_manual_cinnamon_enable() {
+    cmd "gsettings set org.cinnamon enabled-extensions \"['gaze@gundulabs.com']\""
 }
 
 configure_hyprlock_conf() {
@@ -247,6 +263,76 @@ _gsettings_enable_face_auth() {
     gsettings set org.gnome.shell.extensions.gaze enable-face-authentication true
 }
 
+GNOME_ENABLE_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/gaze/gnome-enable.sh"
+GNOME_ENABLE_AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/gaze-gnome-enable.desktop"
+
+# GNOME Shell only scans extension directories at session start, so the dconf write above
+# names a UUID this session has never seen. Shell drops unknown UUIDs the next time it
+# rewrites enabled-extensions, which is why a fresh install can look enabled right up
+# until the first logout. This one-shot autostart re-runs the enable from inside the next
+# session, where Shell does know the extension, and then deletes itself.
+arm_gnome_first_login_enable() {
+    mkdir -p "$(dirname "$GNOME_ENABLE_HELPER")" "$(dirname "$GNOME_ENABLE_AUTOSTART")" || return 1
+
+    cat >"$GNOME_ENABLE_HELPER" <<'HELPER' || return 1
+#!/bin/sh
+# Written by the Gaze installer. Runs at the first GNOME login after install to
+# finish enabling the Gaze extension, then removes itself. Safe to delete.
+EXT_ID="gaze@gundulabs.com"
+autostart="$1"
+
+retire() {
+    rm -f "$autostart" "$0"
+    exit 0
+}
+
+case "${XDG_CURRENT_DESKTOP:-}" in
+*GNOME*) ;;
+*) exit 0 ;;
+esac
+
+# The package is gone; stop trying.
+installed=0
+for dir in "${XDG_DATA_HOME:-$HOME/.local/share}" /usr/local/share /usr/share; do
+    if [ -f "$dir/gnome-shell/extensions/$EXT_ID/metadata.json" ]; then
+        installed=1
+        break
+    fi
+done
+[ "$installed" -eq 1 ] || retire
+
+command -v gnome-extensions >/dev/null 2>&1 || exit 0
+
+# Shell answers queries a little after the session starts.
+i=0
+while [ "$i" -lt 20 ]; do
+    gnome-extensions info "$EXT_ID" >/dev/null 2>&1 && break
+    sleep 1
+    i=$((i + 1))
+done
+
+# Still unscanned: leave the autostart in place and retry next login.
+gnome-extensions info "$EXT_ID" >/dev/null 2>&1 || exit 0
+
+gnome-extensions enable "$EXT_ID" >/dev/null 2>&1 || exit 0
+gsettings set org.gnome.shell.extensions.gaze enable-face-authentication true >/dev/null 2>&1 || true
+
+retire
+HELPER
+    chmod +x "$GNOME_ENABLE_HELPER" || return 1
+
+    cat >"$GNOME_ENABLE_AUTOSTART" <<EOF || return 1
+[Desktop Entry]
+Type=Application
+Name=Gaze face unlock setup
+Comment=Finishes enabling the Gaze GNOME Shell extension after installation
+Exec="$GNOME_ENABLE_HELPER" "$GNOME_ENABLE_AUTOSTART"
+OnlyShowIn=GNOME;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+EOF
+}
+
 enable_gnome_extension() {
     if [ "$(id -u)" -eq 0 ]; then
         warn "Running as root; not changing per-user GNOME extension settings."
@@ -276,17 +362,74 @@ enable_gnome_extension() {
         say "Reboot, then from your GNOME session run:"
         print_manual_gnome_enable
     fi
+
+    if arm_gnome_first_login_enable; then
+        say "${DIM}GNOME Shell forgets extensions it has not scanned yet, so a logout before the${RESET}"
+        say "${DIM}first reboot can undo the step above. A one-shot autostart entry re-applies it${RESET}"
+        say "${DIM}at your next GNOME login and then deletes itself.${RESET}"
+    fi
 }
 
-explain_gnome_extension_skipped() {
-    if want_gnome_extension_package; then
+enable_cinnamon_extension() {
+    if [ "$(id -u)" -eq 0 ]; then
+        warn "Running as root; not changing per-user Cinnamon extension settings."
+        say "For Cinnamon lock screen and PolKit elevation confirmation, run as your desktop user:"
+        print_manual_cinnamon_enable
         return 0
     fi
 
-    say "GNOME desktop session not detected; skipping the GNOME Shell extension package."
+    if ! is_cinnamon_session; then
+        warn "Cinnamon desktop session not detected; leaving the extension disabled for this user."
+        say "For Cinnamon lock screen and PolKit elevation confirmation, from your Cinnamon session:"
+        print_manual_cinnamon_enable
+        return 0
+    fi
+
+    ext_id="gaze@gundulabs.com"
+    if ! command -v gsettings >/dev/null 2>&1; then
+        warn "Could not enable the Cinnamon extension automatically (gsettings not found)."
+        print_manual_cinnamon_enable
+        return 0
+    fi
+
+    current=$(gsettings get org.cinnamon enabled-extensions 2>/dev/null) || current=""
+    case "$current" in
+    *"$ext_id"*)
+        ok "Cinnamon extension is already enabled."
+        ;;
+    "@as []" | "[]" | "")
+        if gsettings set org.cinnamon enabled-extensions "['$ext_id']" 2>/dev/null; then
+            ok "Enabled Cinnamon Gaze extension."
+        else
+            warn "Could not enable the Cinnamon extension automatically."
+            print_manual_cinnamon_enable
+        fi
+        ;;
+    *)
+        new_list=$(printf '%s' "$current" | sed "s/]$/, '$ext_id']/")
+        if gsettings set org.cinnamon enabled-extensions "$new_list" 2>/dev/null; then
+            ok "Enabled Cinnamon Gaze extension."
+        else
+            warn "Could not enable the Cinnamon extension automatically."
+            print_manual_cinnamon_enable
+        fi
+        ;;
+    esac
+}
+
+explain_desktop_extension_skipped() {
+    if want_gnome_extension_package || want_cinnamon_extension_package; then
+        return 0
+    fi
+
+    say "GNOME or Cinnamon desktop session not detected; skipping desktop extension packages."
     say "CLI, GUI, and PAM modules are still installed."
-    say "For non-GNOME desktop/login integration, see:"
+    say "For other desktop/login integration, see:"
     link "$PAM_DOCS_URL"
+}
+
+explain_gnome_extension_skipped() {
+    explain_desktop_extension_skipped
 }
 
 # Non-fatal: a package missing from the repo must not fail the whole install.
@@ -352,10 +495,12 @@ enable_kde() {
 enable_desktop_integrations() {
     if want_gnome_extension_package; then
         enable_gnome_extension
+    elif want_cinnamon_extension_package; then
+        enable_cinnamon_extension
     elif is_kde_session; then
         enable_kde
     else
-        explain_gnome_extension_skipped
+        explain_desktop_extension_skipped
     fi
     enable_hyprlock
 }
@@ -630,6 +775,42 @@ if is_opensuse_tumbleweed && [ "$ARCH" != "x86_64" ]; then
     exit 1
 fi
 
+# ── repository availability ───────────────────────────────────────────────────
+
+repo_metadata_url() {
+    if is_deb; then
+        printf '%s\n' "${PKG_BASE_URL}/deb/dists/${DISTRO_CODENAME}/Release"
+    elif is_opensuse_tumbleweed; then
+        printf '%s\n' "${PKG_BASE_URL}/rpm/opensuse/tumbleweed/${PKG_ARCH}/repodata/repomd.xml"
+    elif is_rpm; then
+        printf '%s\n' "${PKG_BASE_URL}/rpm/fedora/${DISTRO_VERSION_ID}/${PKG_ARCH}/repodata/repomd.xml"
+    fi
+}
+
+require_published_repository() {
+    metadata_url="$(repo_metadata_url)"
+    if [ -z "$metadata_url" ]; then
+        return 0
+    fi
+
+    metadata_status="$(curl -sS -I -o /dev/null -w '%{http_code}' --max-time 20 "$metadata_url" 2>/dev/null || true)"
+    case "$metadata_status" in
+    404 | 403)
+        fail "No Gaze package repository has been published for this platform yet."
+        say "Expected repository metadata at:"
+        link "$metadata_url"
+        say ""
+        say "This platform is supported by the installer, but its packages have not"
+        say "shipped in a release yet. Nothing has been changed on this system."
+        say "Please report it so a release can be cut:"
+        link "https://github.com/GunduLabs/gaze/issues"
+        exit 1
+        ;;
+    esac
+}
+
+require_published_repository
+
 # ── plan ──────────────────────────────────────────────────────────────────────
 
 plan() { printf '  %s\n' "• $*"; }
@@ -643,10 +824,13 @@ if is_deb; then
     if want_gnome_extension_package; then
         plan "Install gaze, gaze-gui, and gaze-gnome-extension"
         plan "Enable GNOME lock screen auth for this user when possible"
+    elif want_cinnamon_extension_package; then
+        plan "Install gaze, gaze-gui, and gaze-cinnamon-extension"
+        plan "Enable Cinnamon extension for this user when possible"
     elif is_kde_session; then
         plan "Install gaze, gaze-gui, and gaze-kde (hands-free KDE lock screen face unlock)"
     else
-        plan "Install gaze and gaze-gui (skip GNOME Shell extension; GNOME not detected)"
+        plan "Install gaze and gaze-gui (skip desktop extension; GNOME/Cinnamon not detected)"
     fi
     if want_hyprlock_setup; then
         plan "Install gaze-hyprlock and configure hyprlock"
@@ -673,10 +857,13 @@ elif is_rpm; then
     if want_gnome_extension_package; then
         plan "Install gaze, gaze-gui, and gaze-gnome-extension"
         plan "Enable GNOME lock screen auth for this user when possible"
+    elif want_cinnamon_extension_package; then
+        plan "Install gaze, gaze-gui, and gaze-cinnamon-extension"
+        plan "Enable Cinnamon extension for this user when possible"
     elif is_kde_session; then
         plan "Install gaze, gaze-gui, and gaze-kde (hands-free KDE lock screen face unlock)"
     else
-        plan "Install gaze and gaze-gui (skip GNOME Shell extension; GNOME not detected)"
+        plan "Install gaze and gaze-gui (skip desktop extension; GNOME/Cinnamon not detected)"
     fi
     if want_hyprlock_setup; then
         plan "Install gaze-hyprlock and configure hyprlock"
@@ -695,10 +882,13 @@ elif is_arch; then
     if want_gnome_extension_package; then
         plan "Install gaze-bin, gaze-gui-bin, and gaze-gnome-extension-bin from the AUR"
         plan "Enable GNOME lock screen auth for this user when possible"
+    elif want_cinnamon_extension_package; then
+        plan "Install gaze-bin, gaze-gui-bin, and gaze-cinnamon-extension-bin from the AUR"
+        plan "Enable Cinnamon extension for this user when possible"
     elif is_kde_session; then
         plan "Install gaze-bin, gaze-gui-bin, and gaze-kde-bin from the AUR (hands-free KDE lock screen face unlock)"
     else
-        plan "Install gaze-bin and gaze-gui-bin from the AUR (skip GNOME Shell extension; GNOME not detected)"
+        plan "Install gaze-bin and gaze-gui-bin from the AUR (skip desktop extension; GNOME/Cinnamon not detected)"
     fi
     if want_hyprlock_setup; then
         plan "Install gaze-hyprlock-bin and configure hyprlock"
@@ -748,6 +938,9 @@ if is_deb; then
     DEB_PKGS="gaze gaze-gui"
     if want_gnome_extension_package; then
         DEB_PKGS="$DEB_PKGS gaze-gnome-extension"
+    fi
+    if want_cinnamon_extension_package; then
+        DEB_PKGS="$DEB_PKGS gaze-cinnamon-extension"
     fi
     if want_hyprlock_setup; then
         DEB_PKGS="$DEB_PKGS gaze-hyprlock"
@@ -824,6 +1017,9 @@ EOF
     if want_gnome_extension_package; then
         RPM_PKGS="$RPM_PKGS gaze-gnome-extension"
     fi
+    if want_cinnamon_extension_package; then
+        RPM_PKGS="$RPM_PKGS gaze-cinnamon-extension"
+    fi
     if want_hyprlock_setup; then
         RPM_PKGS="$RPM_PKGS gaze-hyprlock"
     fi
@@ -897,6 +1093,9 @@ elif is_arch; then
     if want_gnome_extension_package; then
         AUR_PKGS="$AUR_PKGS gaze-gnome-extension-bin"
     fi
+    if want_cinnamon_extension_package; then
+        AUR_PKGS="$AUR_PKGS gaze-cinnamon-extension-bin"
+    fi
     if want_hyprlock_setup; then
         AUR_PKGS="$AUR_PKGS gaze-hyprlock-bin"
     fi
@@ -947,19 +1146,28 @@ fi
 title "Next steps"
 say "  1. ${BOLD}gaze config${RESET}            ${DIM}configure your camera and security settings${RESET}"
 say "  2. ${BOLD}gaze add-face <name>${RESET}   ${DIM}enroll your face${RESET}"
+say "  3. ${BOLD}gaze auth${RESET}              ${DIM}test it in the terminal${RESET}"
 if want_gnome_extension_package; then
-    say "  3. ${BOLD}Reboot${RESET}                 ${DIM}GNOME Shell and GDM only pick up the new extension at startup${RESET}"
+    say "  4. ${BOLD}Reboot${RESET}                 ${DIM}GNOME Shell and GDM only pick up the new extension at startup${RESET}"
+elif want_cinnamon_extension_package; then
+    say "  4. ${BOLD}Restart Cinnamon${RESET}       ${DIM}Press Alt+F2, type r, and press Enter to reload Cinnamon${RESET}"
 fi
 say ""
 title "Try it"
-say "  ${BOLD}gaze auth${RESET}              ${DIM}test face authentication in the terminal${RESET}"
 say "  ${BOLD}gaze-gui${RESET}               ${DIM}open the settings app${RESET}"
+if want_gnome_extension_package || want_cinnamon_extension_package || is_kde_session || want_hyprlock_setup; then
+    say "  ${BOLD}Lock your screen${RESET}       ${DIM}then look at the camera${RESET}"
+fi
 say ""
 title "Desktop integration"
 if want_gnome_extension_package; then
     ok "GNOME lock screen face unlock: enabled for this user (active after reboot)"
     say "  ${DIM}GDM login face auth stays off until you enable it:${RESET}"
     link "${GNOME_DOCS_URL}#optional-enable-face-at-gdm-login"
+elif want_cinnamon_extension_package; then
+    ok "Cinnamon extension: enabled for this user"
+    say "  ${DIM}Provides PolKit elevation confirmation and lock screen authentication:${RESET}"
+    link "$CINNAMON_DOCS_URL"
 elif is_kde_session; then
     if [ "${KDE_PACKAGES_INSTALLED:-0}" -eq 1 ]; then
         ok "KDE Plasma lock screen face unlock: gaze-kde installed"
@@ -970,11 +1178,25 @@ elif is_kde_session; then
     fi
     link "$KDE_DOCS_URL"
 else
-    say "  GNOME extension skipped (GNOME desktop not detected); see the PAM guide:"
+    say "  Desktop extension skipped (GNOME/Cinnamon desktop not detected); see the PAM guide:"
     link "$PAM_DOCS_URL"
 fi
 if want_hyprlock_setup; then
     ok "hyprlock: configured (auth.pam.module = hyprlock-gaze)"
+fi
+say ""
+title "If something does not work"
+say "  ${BOLD}gaze doctor${RESET}            ${DIM}checks every part of the setup and prints the fix for each${RESET}"
+say "  ${DIM}A '○' there marks a feature that is off on purpose; the line below it turns it on.${RESET}"
+if want_gnome_extension_package; then
+    say ""
+    say "  ${DIM}If lock screen face unlock is still missing after the reboot, run from GNOME:${RESET}"
+    print_manual_gnome_enable
+    say "  ${DIM}\"Extension does not exist\" means GNOME Shell has not rescanned yet: reboot and retry.${RESET}"
+elif want_cinnamon_extension_package; then
+    say ""
+    say "  ${DIM}If the Cinnamon extension is not enabled, run from your Cinnamon session:${RESET}"
+    print_manual_cinnamon_enable
 fi
 say ""
 say "Docs:   ${CYAN}https://gaze.gundulabs.com${RESET}"

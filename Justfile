@@ -17,7 +17,7 @@ nfpm := require("nfpm")
 # Required by the `srpm` recipe only.
 rpmbuild := require("rpmbuild")
 # ONNX Runtime release bundled into the offline builds (flatpak and srpm).
-ort_version := env("ORT_VERSION", "1.22.0")
+ort_version := env("ORT_VERSION", "1.29.0")
 
 # The opencv crate probes only the `opencv4`/`opencv` pkg-config names, so distros shipping
 # OpenCV 5 (e.g. Arch) need this override. Empty when opencv4/opencv resolve or opencv5 doesn't.
@@ -256,22 +256,32 @@ _nfpm config format:
         fi
     fi
 
+    is_suse() {
+        local os_rel=""
+        for os_rel in /etc/os-release /usr/lib/os-release; do
+            [ -r "$os_rel" ] || continue
+            (
+                # shellcheck disable=SC1091
+                . "$os_rel"
+                case "${ID:-} ${ID_LIKE:-}" in
+                *opensuse*|*suse*) exit 0 ;;
+                *) exit 1 ;;
+                esac
+            ) && return 0 || return 1
+        done
+        return 1
+    }
+
     # Keep unused dependency placeholders valid YAML after envsubst.
     export DEB_LIB_DEPENDS="      # unused for {{ format }}"
     export RPM_LIB_DEPENDS="      # unused for {{ format }}"
     export RPM_GSTREAMER_BASE="gstreamer1-plugins-base"
     export RPM_GSTREAMER_GOOD="gstreamer1-plugins-good"
     export RPM_GSTREAMER_PIPEWIRE="pipewire-gstreamer"
-    if [ "{{ format }}" = rpm ] && [ -r /etc/os-release ]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        case "${ID:-} ${ID_LIKE:-}" in
-        *opensuse*|*suse*)
-            export RPM_GSTREAMER_BASE="gstreamer-plugins-base"
-            export RPM_GSTREAMER_GOOD="gstreamer-plugins-good"
-            export RPM_GSTREAMER_PIPEWIRE="gstreamer-plugin-pipewire"
-            ;;
-        esac
+    if [ "{{ format }}" = rpm ] && is_suse; then
+        export RPM_GSTREAMER_BASE="gstreamer-plugins-base"
+        export RPM_GSTREAMER_GOOD="gstreamer-plugins-good"
+        export RPM_GSTREAMER_PIPEWIRE="gstreamer-plugin-pipewire"
     fi
     case "{{ format }}" in
     deb) export DEB_LIB_DEPENDS="$lib_depends" ;;
@@ -288,114 +298,320 @@ _dist-packages:
     mkdir -p dist/packages
 
 # Assert every packaged format pins the opencv soversion gazed linked against, so a bump fails the
-# transaction rather than crash-looping, and that arch embeds post_upgrade() from postinst-arch.sh.
+# transaction rather than crash-looping; that every package ships its payload, maintainer scriptlets
+# and upgrade-preserved config files; and that no two packages claim the same path.
 [arg("format", pattern="deb|rpm|archlinux")]
 [private]
 _verify-package format:
     #!/usr/bin/env bash
     set -euo pipefail
 
+    fail() { echo "verify: FAIL: $*" >&2; exit 1; }
+    ok() { echo "verify: $* ✔"; }
+
     newest() { ls -t $1 2>/dev/null | head -n1 || true; }
+
+    locate() {
+        case "{{ format }}" in
+        deb) newest "dist/packages/$1_[0-9]*.deb" ;;
+        rpm) newest "dist/packages/$1-[0-9]*.rpm" ;;
+        archlinux) newest "dist/packages/$1-[0-9]*.pkg.tar.*" ;;
+        esac
+    }
+
+    manifest() {
+        case "{{ format }}" in
+        deb) dpkg-deb -c "$1" | awk '{ print $1 "\t" $3 "\t" $6 }' ;;
+        rpm) rpm -qp --queryformat '[%{FILEMODES:perms}\t%{FILESIZES}\t%{FILENAMES}\n]' "$1" 2>/dev/null ;;
+        archlinux) tar -tvf "$1" | awk '{ print $1 "\t" $3 "\t" $6 }' ;;
+        esac | awk -F'\t' -v OFS='\t' '
+            { path = $3
+              sub(/^\.\//, "/", path)
+              if (path !~ /^\//) path = "/" path
+              sub(/\/+$/, "", path)
+              if (path == "" || path ~ /^\/\./) next
+              type = substr($1, 1, 1)
+              print path, (type == "d" ? "d" : (type == "l" ? "l" : "f")), $2 }'
+    }
+
+    scriptlets() {
+        case "{{ format }}" in
+        deb) dpkg-deb --ctrl-tarfile "$1" | tar -t | sed 's#^\./##; /^$/d' ;;
+        rpm) rpm -qp --scripts "$1" 2>/dev/null | sed -n 's/^\([a-z]*\) scriptlet.*/\1/p' ;;
+        archlinux)
+            local scriptlet status
+            scriptlet=$(tar -xOf "$1" .INSTALL 2>&1) && status=0 || status=$?
+            [ "$status" -eq 0 ] || fail "cannot read .INSTALL from $(basename "$1"): $scriptlet"
+            # nfpm >= 2.47 wraps each hook as `function post_install() {`; older
+            # releases emitted a bare `post_install() {`. Accept both.
+            sed -nE 's/^(function[[:space:]]+)?([a-z_]+)[[:space:]]*\(\).*/\2/p' <<< "$scriptlet"
+            ;;
+        esac
+    }
+
+    config_files() {
+        case "{{ format }}" in
+        deb) dpkg-deb -I "$1" conffiles 2>/dev/null | awk 'NF { print $1 }' || true ;;
+        rpm) rpm -qp --queryformat '[%{FILENAMES}\t%{FILEFLAGS:fflags}\n]' "$1" 2>/dev/null | awk -F'\t' '$2 ~ /c/ && $2 ~ /n/ { print $1 }' ;;
+        archlinux) tar -xOf "$1" .PKGINFO | sed -n 's#^backup = #/#p' ;;
+        esac
+    }
+
+    depends_of() {
+        case "{{ format }}" in
+        deb) dpkg-deb -f "$1" Depends | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]*\(.*$//; /^$/d' ;;
+        rpm) rpm -qp --requires "$1" 2>/dev/null ;;
+        archlinux) tar -xOf "$1" .PKGINFO | sed -n 's/^depend = //p' ;;
+        esac
+    }
+
+    pkg_version() {
+        case "{{ format }}" in
+        deb) dpkg-deb -f "$1" Version ;;
+        rpm) rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null ;;
+        archlinux) tar -xOf "$1" .PKGINFO | sed -n 's/^pkgver = //p' ;;
+        esac
+    }
+
+    pkg_arch() {
+        case "{{ format }}" in
+        deb) dpkg-deb -f "$1" Architecture ;;
+        rpm) rpm -qp --queryformat '%{ARCH}' "$1" 2>/dev/null ;;
+        archlinux) tar -xOf "$1" .PKGINFO | sed -n 's/^arch = //p' ;;
+        esac
+    }
+
+    owned=$(mktemp)
+    trap 'rm -f "$owned"' EXIT
+    versions=()
+    arches=()
+
+    load() {
+        pkg=$(locate "$1")
+        [ -n "$pkg" ] || fail "no {{ format }} $1 package in dist/packages"
+        base=$(basename "$pkg")
+        rows=$(manifest "$pkg")
+        paths=$(cut -f1 <<< "$rows")
+        depends=$(depends_of "$pkg")
+        versions+=("$(pkg_version "$pkg")")
+        arches+=("$(pkg_arch "$pkg")")
+        [ -n "$paths" ] || fail "$base ships no files"
+        awk -F'\t' -v n="$base" '$2 != "d" { print $1 "\t" n }' <<< "$rows" >> "$owned"
+        if grep -Eq -- '-(dev|devel)$' <<< "$depends"; then
+            fail "$base depends on a development package: $(tr '\n' ' ' <<< "$depends")"
+        fi
+    }
+
+    want_files() {
+        local missing=() p
+        for p in "$@"; do grep -Fxq "$p" <<< "$paths" || missing+=("$p"); done
+        [ ${#missing[@]} -eq 0 ] || fail "$base does not ship: ${missing[*]}"
+    }
+
+    want_size() {
+        local size
+        size=$(awk -F'\t' -v p="$1" '$1 == p && $2 == "f" { print $3; exit }' <<< "$rows")
+        [ -n "$size" ] || fail "$base does not ship $1 as a regular file"
+        [ "$size" -ge "$2" ] || fail "$base ships a ${size}-byte $1; expected at least $2 bytes"
+    }
+
+    want_scripts() {
+        local have missing=() s
+        have=$(scriptlets "$pkg")
+        for s in "$@"; do grep -Fxq "$s" <<< "$have" || missing+=("$s"); done
+        [ ${#missing[@]} -eq 0 ] || fail "$base lacks maintainer scriptlets: ${missing[*]}; upgrades will skip them"
+    }
+
+    want_config() {
+        local have missing=() p
+        have=$(config_files "$pkg")
+        for p in "$@"; do grep -Fxq "$p" <<< "$have" || missing+=("$p"); done
+        [ ${#missing[@]} -eq 0 ] || fail "$base does not preserve local edits to: ${missing[*]}"
+    }
+
+    want_depends() {
+        local missing=() d
+        for d in "$@"; do grep -Fxq "$d" <<< "$depends" || missing+=("$d"); done
+        [ ${#missing[@]} -eq 0 ] || fail "$base lacks runtime dependencies: ${missing[*]}; has $(tr '\n' ' ' <<< "$depends")"
+    }
+
+    want_opencv_bounds() {
+        if grep -Eq '^opencv>=[0-9]+\.[0-9]+$' <<< "$depends" && grep -Eq '^opencv<[0-9]+\.[0-9]+$' <<< "$depends"; then
+            ok "$base pins opencv ($(grep -E '^opencv[<>=]' <<< "$depends" | tr '\n' ' '))"
+        else
+            fail "$base lacks a version-bounded opencv dependency; an opencv soname bump will crash-loop it"
+        fi
+    }
+
+    is_suse() {
+        local os_rel=""
+        for os_rel in /etc/os-release /usr/lib/os-release; do
+            [ -r "$os_rel" ] || continue
+            (
+                # shellcheck disable=SC1091
+                . "$os_rel"
+                case "${ID:-} ${ID_LIKE:-}" in
+                *opensuse*|*suse*) exit 0 ;;
+                *) exit 1 ;;
+                esac
+            ) && return 0 || return 1
+        done
+        return 1
+    }
+
+    suse=""
+    if [ "{{ format }}" = rpm ] && is_suse; then
+        suse=1
+    fi
 
     case "{{ format }}" in
     deb)
-        for name in gaze gaze-gui; do
-            pkg=$(newest "dist/packages/${name}_[0-9]*.deb")
-            [ -n "$pkg" ] || { echo "verify: no $name deb in dist/packages" >&2; exit 1; }
-            depends=$(dpkg-deb -f "$pkg" Depends)
-            case ",${depends}," in
-            *-dev[,\ ]*)
-                echo "verify: FAIL: $(basename "$pkg") depends on a -dev package: $depends" >&2
-                exit 1
-                ;;
-            esac
-            declared=$(tr ',' '\n' <<< "$depends" | sed -E 's/^[[:space:]]+//; s/[[:space:]]*\(.*$//')
-            for dep in gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire; do
-                if ! grep -Fxq "$dep" <<< "$declared"; then
-                    echo "verify: FAIL: $(basename "$pkg") lacks GStreamer runtime dependency $dep: $depends" >&2
-                    exit 1
-                fi
-            done
-            if grep -Eq 'libopencv-core[0-9]' <<< "$depends"; then
-                echo "verify: $(basename "$pkg") pins opencv ($(grep -oE 'libopencv-[a-z]+[0-9]+[a-z0-9]*' <<< "$depends" | tr '\n' ' ')) ✔"
-            elif [ "$name" = "gaze" ]; then
-                echo "verify: FAIL: $(basename "$pkg") lacks a soversioned opencv dependency: $depends" >&2
-                exit 1
-            else
-                echo "verify: $(basename "$pkg") declares library dependencies ✔"
-            fi
-        done
+        post=postinst; preun=prerm; postun=postrm
+        gst=(gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire)
         ;;
     rpm)
-        gst_deps=(gstreamer1-plugins-base gstreamer1-plugins-good pipewire-gstreamer)
-        if [ -r /etc/os-release ]; then
-            # shellcheck disable=SC1091
-            . /etc/os-release
-            case "${ID:-} ${ID_LIKE:-}" in
-            *opensuse*|*suse*) gst_deps=(gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugin-pipewire) ;;
-            esac
+        post=postinstall; preun=preuninstall; postun=postuninstall
+        if [ -n "$suse" ]; then
+            gst=(gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugin-pipewire)
+        else
+            gst=(gstreamer1-plugins-base gstreamer1-plugins-good pipewire-gstreamer)
         fi
-        for name in gaze gaze-gui; do
-            pkg=$(newest "dist/packages/${name}-[0-9]*.rpm")
-            [ -n "$pkg" ] || { echo "verify: no $name rpm in dist/packages" >&2; exit 1; }
-            requires=$(rpm -qp --requires "$pkg" 2>/dev/null)
-            for dep in "${gst_deps[@]}"; do
-                if ! grep -Fxq "$dep" <<< "$requires"; then
-                    echo "verify: FAIL: $(basename "$pkg") lacks GStreamer runtime dependency $dep" >&2
-                    exit 1
-                fi
-            done
-            if [ "$name" = gaze ]; then
-                if grep -Eq 'libopencv_core\.so\.[0-9]+' <<< "$requires"; then
-                    echo "verify: $(basename "$pkg") pins opencv ($(grep -oE 'libopencv_[a-z0-9]+\.so\.[0-9]+' <<< "$requires" | tr '\n' ' ')) ✔"
-                else
-                    echo "verify: FAIL: $(basename "$pkg") lacks a soname opencv requirement" >&2
-                    exit 1
-                fi
-            fi
-            echo "verify: $(basename "$pkg") declares GStreamer runtime plugins ✔"
-        done
         ;;
     archlinux)
-        pkg=$(newest "dist/packages/gaze-[0-9]*.pkg.tar.*")
-        [ -n "$pkg" ] || { echo "verify: no arch gaze package in dist/packages" >&2; exit 1; }
-        if tar -xOf "$pkg" .INSTALL 2>/dev/null | grep -q 'post_upgrade *()'; then
-            echo "verify: $(basename "$pkg") embeds post_upgrade() ✔"
-        else
-            echo "verify: FAIL: $(basename "$pkg") is missing post_upgrade(); arch upgrades will skip postinst-arch.sh" >&2
-            exit 1
-        fi
-        for name in gaze-gnome-extension gaze-hyprlock; do
-            pkg=$(newest "dist/packages/${name}-[0-9]*.pkg.tar.*")
-            [ -n "$pkg" ] || { echo "verify: no arch $name package in dist/packages" >&2; exit 1; }
-            if tar -xOf "$pkg" .INSTALL 2>/dev/null | grep -q 'post_upgrade *()'; then
-                echo "verify: $(basename "$pkg") embeds post_upgrade() ✔"
-            else
-                echo "verify: FAIL: $(basename "$pkg") is missing post_upgrade(); arch upgrades will skip its scriptlet" >&2
-                exit 1
-            fi
-        done
-        for name in gaze gaze-gui; do
-            pkg=$(newest "dist/packages/${name}-[0-9]*.pkg.tar.*")
-            [ -n "$pkg" ] || { echo "verify: no arch $name package in dist/packages" >&2; exit 1; }
-            pkginfo=$(tar -xOf "$pkg" .PKGINFO 2>/dev/null)
-            if grep -Eq 'depend = opencv>=[0-9]+\.[0-9]+$' <<< "$pkginfo" \
-                && grep -Eq 'depend = opencv<[0-9]+\.[0-9]+$' <<< "$pkginfo"; then
-                echo "verify: $(basename "$pkg") pins opencv ($(grep -oE 'opencv[<>=]+[0-9.]+' <<< "$pkginfo" | tr '\n' ' ')) ✔"
-            else
-                echo "verify: FAIL: $(basename "$pkg") lacks a version-bounded opencv dependency; an opencv soname bump will crash-loop it" >&2
-                exit 1
-            fi
-            for dep in gst-plugins-base gst-plugins-good gst-plugin-pipewire; do
-                if ! grep -Fxq "depend = $dep" <<< "$pkginfo"; then
-                    echo "verify: FAIL: $(basename "$pkg") lacks GStreamer runtime dependency $dep" >&2
-                    exit 1
-                fi
-            done
-            echo "verify: $(basename "$pkg") declares GStreamer runtime plugins ✔"
-        done
+        post=post_install; preun=pre_remove; postun=post_remove
+        gst=(gst-plugins-base gst-plugins-good gst-plugin-pipewire)
         ;;
     esac
+
+    load gaze
+    want_files /usr/bin/gazed /usr/bin/gaze /etc/gaze/config.toml \
+        /etc/dbus-1/system.d/com.gundulabs.Gaze.conf \
+        /usr/share/polkit-1/actions/com.gundulabs.gaze.policy \
+        /usr/lib/systemd/system/gazed.service
+    want_size /usr/bin/gazed 100000
+    want_size /usr/bin/gaze 100000
+    want_config /etc/gaze/config.toml /etc/dbus-1/system.d/com.gundulabs.Gaze.conf
+    want_scripts "$post" "$preun"
+    want_depends "${gst[@]}"
+    case "{{ format }}" in
+    deb)
+        want_files "/lib/{{ multiarch }}/security/pam_gaze.so" \
+            "/lib/{{ multiarch }}/security/pam_gaze_grosshack.so" \
+            /usr/lib/security/pam_gaze.so /usr/lib/security/pam_gaze_grosshack.so \
+            /usr/share/pam-configs/gaze /usr/share/pam-configs/gaze-simultaneous
+        want_size "/lib/{{ multiarch }}/security/pam_gaze.so" 20000
+        want_size "/lib/{{ multiarch }}/security/pam_gaze_grosshack.so" 20000
+        for module in pam_gaze pam_gaze_grosshack; do
+            target=$(dpkg-deb -c "$pkg" | sed -n "s#.* \./usr/lib/security/${module}\.so -> ##p")
+            [ "$target" = "/lib/{{ multiarch }}/security/${module}.so" ] || {
+                echo "verify: FAIL: $base points /usr/lib/security/${module}.so at '${target}'," >&2
+                fail "expected /lib/{{ multiarch }}/security/${module}.so; libpam will not find the module"
+            }
+        done
+        want_depends libpam0g
+        if grep -Eq 'libopencv-core[0-9]' <<< "$depends"; then
+            ok "$base pins opencv ($(grep -oE 'libopencv-[a-z]+[0-9]+[a-z0-9]*' <<< "$depends" | tr '\n' ' '))"
+        else
+            fail "$base lacks a soversioned opencv dependency: $(tr '\n' ' ' <<< "$depends")"
+        fi
+        ;;
+    rpm)
+        want_files /usr/lib64/security/pam_gaze.so /usr/lib64/security/pam_gaze_grosshack.so \
+            /usr/share/gaze/gaze-gdm-camera.pp
+        want_size /usr/lib64/security/pam_gaze.so 20000
+        want_size /usr/lib64/security/pam_gaze_grosshack.so 20000
+        if [ -n "$suse" ]; then
+            want_files /usr/lib/pam-config.d/gaze.conf
+            want_depends pam pam-config
+        else
+            want_files /usr/share/authselect/vendor/gaze/system-auth \
+                /usr/share/authselect/vendor/gaze/password-auth \
+                /usr/share/authselect/vendor/gaze/fingerprint-auth
+            want_depends pam
+        fi
+        if grep -Eq 'libopencv_core\.so\.[0-9]+' <<< "$depends"; then
+            ok "$base pins opencv ($(grep -oE 'libopencv_[a-z0-9]+\.so\.[0-9]+' <<< "$depends" | tr '\n' ' '))"
+        else
+            fail "$base lacks a soname opencv requirement"
+        fi
+        ;;
+    archlinux)
+        want_files /usr/lib/security/pam_gaze.so /usr/lib/security/pam_gaze_grosshack.so
+        want_size /usr/lib/security/pam_gaze.so 20000
+        want_size /usr/lib/security/pam_gaze_grosshack.so 20000
+        want_scripts post_upgrade
+        want_depends pam tpm2-tss
+        want_opencv_bounds
+        ;;
+    esac
+    ok "$base ships its daemon, PAM modules, polkit action, unit and config"
+
+    load gaze-gui
+    want_files /usr/bin/gaze-gui /usr/share/applications/com.gundulabs.Gaze.desktop \
+        /usr/share/icons/hicolor/scalable/apps/com.gundulabs.Gaze.svg \
+        /usr/share/metainfo/com.gundulabs.Gaze.metainfo.xml
+    want_size /usr/bin/gaze-gui 100000
+    want_depends "${gst[@]}"
+    if [ "{{ format }}" = archlinux ]; then
+        want_depends gtk4 libadwaita
+        want_opencv_bounds
+    fi
+    ok "$base ships its binary, desktop entry, icon and metainfo"
+
+    load gaze-gnome-extension
+    want_files /usr/share/gnome-shell/extensions/gaze@gundulabs.com/metadata.json \
+        /usr/share/gnome-shell/extensions/gaze@gundulabs.com/extension.js \
+        /usr/share/gnome-shell/extensions/gaze@gundulabs.com/prefs.js \
+        /usr/share/glib-2.0/schemas/org.gnome.shell.extensions.gaze.gschema.xml \
+        /etc/dconf/db/gdm.d/00-gaze-defaults /usr/share/gaze/dconf-profile-gdm \
+        /etc/pam.d/gdm-face
+    want_config /etc/dconf/db/gdm.d/00-gaze-defaults /etc/pam.d/gdm-face
+    want_scripts "$post" "$postun"
+    want_depends gnome-shell
+    if [ "{{ format }}" = archlinux ]; then
+        want_scripts post_upgrade
+    fi
+    ok "$base ships the extension, gschema, gdm defaults and gdm-face stack"
+
+    load gaze-cinnamon-extension
+    want_files /usr/share/cinnamon/extensions/gaze@gundulabs.com/metadata.json \
+        /usr/share/cinnamon/extensions/gaze@gundulabs.com/extension.js \
+        /usr/share/cinnamon/extensions/gaze@gundulabs.com/settings-schema.json
+    want_depends cinnamon
+    ok "$base ships the Cinnamon extension files"
+
+    load gaze-hyprlock
+    want_files /etc/pam.d/hyprlock-gaze /etc/pam.d/hyprlock-gaze-simultaneous
+    want_config /etc/pam.d/hyprlock-gaze /etc/pam.d/hyprlock-gaze-simultaneous
+    want_scripts "$post" "$postun"
+    if [ "{{ format }}" = archlinux ]; then
+        want_scripts post_upgrade
+    fi
+    ok "$base ships both hyprlock PAM stacks"
+
+    load gaze-kde
+    want_files /usr/bin/gaze-kde-pam \
+        /usr/share/plasma/systemsettings/externalmodules/gaze-face-unlock.desktop
+    want_size /usr/bin/gaze-kde-pam 1000
+    want_scripts "$post" "$postun"
+    if [ "{{ format }}" = archlinux ]; then
+        want_scripts post_upgrade
+    fi
+    if grep -Fxq /etc/pam.d/kde-fingerprint <<< "$paths"; then
+        fail "$base ships /etc/pam.d/kde-fingerprint, which plasma-workspace owns; the transaction will conflict"
+    fi
+    ok "$base ships the PAM helper and System Settings entry, and claims no plasma-owned file"
+
+    unique_versions=$(printf '%s\n' "${versions[@]}" | sort -u)
+    [ "$(wc -l <<< "$unique_versions")" -eq 1 ] \
+        || fail "packages disagree on version: $(tr '\n' ' ' <<< "$unique_versions"); dist/packages holds stale artifacts"
+    unique_arches=$(printf '%s\n' "${arches[@]}" | sort -u)
+    [ "$(wc -l <<< "$unique_arches")" -eq 1 ] \
+        || fail "packages disagree on architecture: $(tr '\n' ' ' <<< "$unique_arches")"
+    overlap=$(cut -f1 "$owned" | sort | uniq -d)
+    [ -z "$overlap" ] \
+        || fail "more than one package ships: $(tr '\n' ' ' <<< "$overlap")"
+    ok "all ${#versions[@]} packages are $unique_versions ($unique_arches) and claim disjoint paths"
 
 # Build nfpm packages for a given packager
 [arg("format", pattern="deb|rpm|archlinux")]
@@ -410,16 +626,28 @@ package-prebuilt format: _dist-packages
     #!/usr/bin/env bash
     set -euo pipefail
 
+    is_suse() {
+        local os_rel=""
+        for os_rel in /etc/os-release /usr/lib/os-release; do
+            [ -r "$os_rel" ] || continue
+            (
+                # shellcheck disable=SC1091
+                . "$os_rel"
+                case "${ID:-} ${ID_LIKE:-}" in
+                *opensuse*|*suse*) exit 0 ;;
+                *) exit 1 ;;
+                esac
+            ) && return 0 || return 1
+        done
+        return 1
+    }
+
     # Use SUSE manifests together so packages do not mix PAM stack formats.
     # Other RPM hosts keep the existing manifests.
 
-    configs=(packaging/nfpm.yaml packaging/nfpm-gui.yaml packaging/nfpm-gnome-extension.yaml packaging/nfpm-hyprlock.yaml packaging/nfpm-kde.yaml)
-    if [ "{{ format }}" = rpm ] && [ -r /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    case "${ID:-} ${ID_LIKE:-}" in
-    *opensuse*|*suse*) configs=(packaging/nfpm-opensuse.yaml packaging/nfpm-gui.yaml packaging/nfpm-gnome-extension-opensuse.yaml packaging/nfpm-hyprlock-opensuse.yaml packaging/nfpm-kde.yaml) ;;
-    esac
+    configs=(packaging/nfpm.yaml packaging/nfpm-gui.yaml packaging/nfpm-gnome-extension.yaml packaging/nfpm-cinnamon-extension.yaml packaging/nfpm-hyprlock.yaml packaging/nfpm-kde.yaml)
+    if [ "{{ format }}" = rpm ] && is_suse; then
+        configs=(packaging/nfpm-opensuse.yaml packaging/nfpm-gui.yaml packaging/nfpm-gnome-extension-opensuse.yaml packaging/nfpm-cinnamon-extension.yaml packaging/nfpm-hyprlock-opensuse.yaml packaging/nfpm-kde.yaml)
     fi
 
     for config in "${configs[@]}"; do {{ quote(just_executable()) }} _nfpm "$config" "{{ format }}"; done

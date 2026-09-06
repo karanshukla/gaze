@@ -25,8 +25,8 @@ use gaze_core::config::Config;
 use gaze_core::dbus::{CaptureStatus, EnrollPrompt, VerifyResult};
 use gaze_core::detect::FaceDetector;
 use gaze_core::face::{
-    EnrollmentPoseStability, FaceChecker, IrDarkFrameGate, IrFrameKind, Spectrum,
-    enrollment_pose_matches,
+    EnrollmentPoseStability, FaceChecker, IrDarkFrameGate, IrFrameKind, RgbFrameKind,
+    RgbWarmupGate, Spectrum, enrollment_pose_matches,
 };
 use gaze_core::ir::led::IrLed;
 
@@ -831,6 +831,13 @@ mod tests {
         assert!(VERIFY_WATCHDOG_POLL < VERIFY_TOO_DARK_TIMEOUT);
         assert!(VERIFY_WATCHDOG_POLL < VERIFY_NO_USABLE_TIMEOUT);
         assert!(!VERIFY_WATCHDOG_POLL.is_zero());
+    }
+
+    #[test]
+    fn a_warming_camera_still_reports_dark_before_the_no_face_deadline() {
+        use super::{RgbWarmupGate, VERIFY_NO_FACE_TIMEOUT, VERIFY_TOO_DARK_TIMEOUT};
+
+        assert!(RgbWarmupGate::WARMUP + VERIFY_TOO_DARK_TIMEOUT < VERIFY_NO_FACE_TIMEOUT);
     }
 
     // A backstop that fired first would report a timeout for a run the daemon had already decided.
@@ -2014,7 +2021,12 @@ pub async fn watch_session_locks(conn: zbus::Connection, lock_epochs: LockEpochs
             continue;
         };
 
+        let live = gaze_core::dbus::session_paths_on(&conn).await.ok();
+
         let mut epochs = lock_epochs.lock().await;
+        if let Some(live) = live {
+            epochs.retain(|session, _| live.iter().any(|path| path == session));
+        }
         if locked {
             epochs.entry(path).or_insert_with(std::time::Instant::now);
         } else {
@@ -3129,6 +3141,7 @@ impl AuthDaemon {
             let mut last_emitted_status = None;
 
             let mut last_sent_prompt = None;
+            let mut aborted = false;
 
             while completed_steps < max_steps as usize {
                 let prompt = prompts[completed_steps];
@@ -3141,8 +3154,8 @@ impl AuthDaemon {
                     _ = &mut rx => {
                         info!("EnrollStart: cancelled");
                         let _ = Self::enroll_status(&ctxt, &face_name, completed_steps as u32, max_steps, true, EnrollPrompt::Cancelled, -1.0).await;
-                        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return;
+                        aborted = true;
+                        break;
                     }
                     Some(jpeg) = preview_rx.recv() => {
                         let _ = Self::preview_frame(&ctxt, &jpeg).await;
@@ -3151,8 +3164,8 @@ impl AuthDaemon {
                         let Some(msg) = msg_opt else {
                             warn!("EnrollStart: all capture threads exited before enrollment finished");
                             let _ = Self::enroll_status(&ctxt, &face_name, completed_steps as u32, max_steps, true, EnrollPrompt::CameraFailed, -1.0).await;
-                            stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return;
+                            aborted = true;
+                            break;
                         };
                         match msg {
                             EnrollMsg::Status(step, spectrum, status) => {
@@ -3227,8 +3240,8 @@ impl AuthDaemon {
                             EnrollMsg::Error(e) => {
                                 error!("Enrollment error: {e}");
                                 let _ = Self::enroll_status(&ctxt, &face_name, completed_steps as u32, max_steps, true, EnrollPrompt::CameraFailed, -1.0).await;
-                                stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                                return;
+                                aborted = true;
+                                break;
                             }
                         }
                     }
@@ -3236,15 +3249,17 @@ impl AuthDaemon {
             }
 
             stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            let mut db = db_arc.lock().await;
-            match db.add_template(&username, &face_name, &template_id, captured_embeddings) {
-                Ok(_) => {
-                    info!("Template saved successfully!");
-                    let _ = Self::enroll_status(&ctxt, &face_name, max_steps, max_steps, true, EnrollPrompt::Completed, 0.0).await;
-                }
-                Err(e) => {
-                    error!("DB error saving template: {}", e);
-                    let _ = Self::enroll_status(&ctxt, &face_name, max_steps, max_steps, true, EnrollPrompt::DbFailed, -1.0).await;
+            if !aborted {
+                let mut db = db_arc.lock().await;
+                match db.add_template(&username, &face_name, &template_id, captured_embeddings) {
+                    Ok(_) => {
+                        info!("Template saved successfully!");
+                        let _ = Self::enroll_status(&ctxt, &face_name, max_steps, max_steps, true, EnrollPrompt::Completed, 0.0).await;
+                    }
+                    Err(e) => {
+                        error!("DB error saving template: {}", e);
+                        let _ = Self::enroll_status(&ctxt, &face_name, max_steps, max_steps, true, EnrollPrompt::DbFailed, -1.0).await;
+                    }
                 }
             }
 
@@ -3395,6 +3410,10 @@ impl AuthDaemon {
             .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
         new_config
             .liveness
+            .validate()
+            .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
+        new_config
+            .cameras
             .validate()
             .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
 
@@ -3826,6 +3845,13 @@ impl AuthDaemon {
                     tracing::debug!("RGB camera opened successfully at: {}", rgb_device_clone);
 
                     let mut checker = FaceChecker::new(detector_arc, &config_clone, Spectrum::Rgb, false);
+                    let dark_hands_over_to_ir = should_yield_rgb_to_ir(
+                        &hybrid_policy_clone,
+                        run_ir,
+                        CaptureStatus::TooDark,
+                    );
+                    let mut warmup = RgbWarmupGate::new(config_clone.cameras.dark_luma_threshold);
+                    let mut logged_dark_stream = false;
                     let mut logged_rgb_luma_statuses = Vec::new();
                     let mut live_scores: Vec<f32> = Vec::new();
                     let mut landmark_seq: Vec<[(f32, f32); 5]> = Vec::new();
@@ -3841,6 +3867,44 @@ impl AuthDaemon {
                             // match, so hybrid auth can still capture the IR spectrum.
                             yielded_to_ir = true;
                             break;
+                        }
+
+                        if !dark_hands_over_to_ir {
+                            match warmup.classify_with_luma(&frame) {
+                                (RgbFrameKind::Lit, _) => {}
+                                (RgbFrameKind::WarmupDark, _) => continue,
+                                (RgbFrameKind::SettledDark, luma) => {
+                                    if let Some(node) = cam.fall_back_to_v4l2() {
+                                        let message = format!(
+                                            "RGB stream stayed dark through PipeWire (mean_luma={luma}); retrying on {node}"
+                                        );
+                                        info!("{message}");
+                                        let _ = tx.blocking_send(VerifyMsg::Diagnostic(message));
+                                        let _ = tx.blocking_send(VerifyMsg::PhaseStarted(Spectrum::Rgb));
+                                        warmup = RgbWarmupGate::new(config_clone.cameras.dark_luma_threshold);
+                                        logged_dark_stream = false;
+                                        continue;
+                                    }
+                                    if !logged_dark_stream {
+                                        let message = format!(
+                                            "RGB stream remains dark after warmup: mean_luma={luma}"
+                                        );
+                                        info!("{message}");
+                                        let _ = tx.blocking_send(VerifyMsg::Diagnostic(message));
+                                        logged_dark_stream = true;
+                                    }
+                                }
+                                (RgbFrameKind::SteadyDark, luma) => {
+                                    if !logged_dark_stream {
+                                        let message = format!(
+                                            "RGB stream never brightened: mean_luma={luma}"
+                                        );
+                                        info!("{message}");
+                                        let _ = tx.blocking_send(VerifyMsg::Diagnostic(message));
+                                        logged_dark_stream = true;
+                                    }
+                                }
+                            }
                         }
 
                         let (status, embed_opt) = {
@@ -4196,6 +4260,12 @@ impl AuthDaemon {
                             VerifyMsg::PhaseStarted(Spectrum::Ir) if serial_capture => {
                                 // RGB and IR run serially on single-function cameras. Give
                                 // IR a fresh no-face window after RGB releases the device.
+                                last_face_at = Instant::now();
+                                last_usable_at = Instant::now();
+                                frames_seen = 0;
+                                dark_since = None;
+                            }
+                            VerifyMsg::PhaseStarted(Spectrum::Rgb) => {
                                 last_face_at = Instant::now();
                                 last_usable_at = Instant::now();
                                 frames_seen = 0;

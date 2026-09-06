@@ -22,6 +22,7 @@ use gaze_core::config::{
 use gaze_core::dbus::{
     CaptureStatus, EnrollPrompt, GazeProxy, VerifyResult, apply_config_to_daemon, connect_gaze,
     dbus_error_message, dbus_is_file_not_found, load_config_from_daemon,
+    try_load_config_from_daemon,
 };
 use std::{future::Future, time::Duration};
 use tui::{AuthScreen, BusyScreen, EnrollScreen, Tone, TuiAction, TuiTerminal};
@@ -983,8 +984,48 @@ async fn handle_auth(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpectrumBadge {
+    /// The profile holds captures for this spectrum.
+    Enrolled,
+    /// A camera is configured for it, but this profile never captured it.
+    Missing,
+    /// No camera for this spectrum, so there is nothing to enroll.
+    Unused,
+}
+
+/// A spectrum you never configured a camera for is not a gap in the profile, so
+/// it must not read like one.
+fn spectrum_badge_state(enrolled: bool, configured: bool) -> SpectrumBadge {
+    match (enrolled, configured) {
+        (true, _) => SpectrumBadge::Enrolled,
+        (false, true) => SpectrumBadge::Missing,
+        (false, false) => SpectrumBadge::Unused,
+    }
+}
+
+fn spectrum_badge(label: &str, enrolled: bool, configured: bool) -> String {
+    let badge = format!("[{label}]");
+    match spectrum_badge_state(enrolled, configured) {
+        SpectrumBadge::Enrolled => style(badge).green().bold().to_string(),
+        SpectrumBadge::Missing => style(badge).yellow().bold().to_string(),
+        SpectrumBadge::Unused => style(badge).dim().to_string(),
+    }
+}
+
 async fn handle_list_faces(proxy: &GazeProxy<'_>, user: &str) -> anyhow::Result<()> {
     let term = Term::stdout();
+    let cameras = try_load_config_from_daemon(proxy)
+        .await
+        .ok()
+        .flatten()
+        .map(|config| {
+            (
+                !config.cameras.rgb.trim().is_empty(),
+                !config.cameras.ir.trim().is_empty(),
+            )
+        });
+    let (rgb_configured, ir_configured) = cameras.unwrap_or((true, true));
     let result = run_busy(
         "Face database",
         format!("Fetching faces for {user}..."),
@@ -1009,16 +1050,8 @@ async fn handle_list_faces(proxy: &GazeProxy<'_>, user: &str) -> anyhow::Result<
                     style(user).bold()
                 ))?;
                 for (face, count, has_rgb, has_ir) in faces {
-                    let rgb_badge = if has_rgb {
-                        style("[RGB]").green().bold().to_string()
-                    } else {
-                        style("[RGB]").red().bold().to_string()
-                    };
-                    let ir_badge = if has_ir {
-                        style("[IR]").green().bold().to_string()
-                    } else {
-                        style("[IR]").red().bold().to_string()
-                    };
+                    let rgb_badge = spectrum_badge("RGB", has_rgb, rgb_configured);
+                    let ir_badge = spectrum_badge("IR", has_ir, ir_configured);
                     term.write_line(&format!(
                         "  {} {} {} {} ({} capture{})",
                         style("•").cyan(),
@@ -1498,6 +1531,13 @@ fn build_uninstall_plan(keep_data: bool) -> Vec<(&'static str, String)> {
             .into(),
     ));
     plan.push((
+        "Remove the installer's one-shot GNOME enable",
+        "for h in /home/* /root; do \
+          sudo rm -f \"$h/.config/autostart/gaze-gnome-enable.desktop\" \"$h/.local/share/gaze/gnome-enable.sh\"; \
+          done"
+            .into(),
+    ));
+    plan.push((
         "Remove GDM dconf overrides",
         remove_gdm_dconf_overrides_cmd(),
     ));
@@ -1903,6 +1943,27 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfigured_spectrum_reads_as_unlit_not_as_a_failure() {
+        assert_eq!(spectrum_badge_state(true, true), SpectrumBadge::Enrolled);
+        assert_eq!(
+            spectrum_badge_state(true, false),
+            SpectrumBadge::Enrolled,
+            "captures already taken stay green even after the camera is unset"
+        );
+        assert_eq!(
+            spectrum_badge_state(false, true),
+            SpectrumBadge::Missing,
+            "a configured camera the profile never captured is a real gap"
+        );
+        assert_eq!(
+            spectrum_badge_state(false, false),
+            SpectrumBadge::Unused,
+            "an RGB-only machine has nothing to enroll for IR, so IR is not a failure"
+        );
+        assert!(spectrum_badge("RGB", true, true).contains("[RGB]"));
+    }
+
+    #[test]
     fn cli_parses_auth_and_safe_uninstall_flags() {
         let cli = Cli::try_parse_from(["gaze", "auth", "--user", "alice", "--verbose"]).unwrap();
         assert!(matches!(
@@ -2253,5 +2314,236 @@ mod tests {
         assert!(command.contains("/etc/gaze/pam-arch.polkit-configured"));
         assert!(command.contains("/etc/gaze/pam-arch.polkit-dev-configured"));
         assert!(command.contains("rm -f"));
+    }
+
+    fn is_valid_shell(command: &str) -> Result<(), String> {
+        let output = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    }
+
+    #[test]
+    fn every_capture_status_maps_to_a_tone() {
+        // Green only once the frame is actually usable.
+        assert!(matches!(capture_tone(CaptureStatus::Ready), Tone::Good));
+        assert!(matches!(capture_tone(CaptureStatus::Usable), Tone::Good));
+
+        // Red when there is nothing to work with at all.
+        assert!(matches!(capture_tone(CaptureStatus::Unused), Tone::Error));
+        assert!(matches!(capture_tone(CaptureStatus::NoFace), Tone::Error));
+
+        // Amber for something the user can correct by moving or turning a light on.
+        for status in [
+            CaptureStatus::TooDark,
+            CaptureStatus::Clipped,
+            CaptureStatus::NotCentered,
+            CaptureStatus::TooFar,
+            CaptureStatus::TooClose,
+        ] {
+            assert!(
+                matches!(capture_tone(status), Tone::Warn),
+                "{status:?} is a recoverable framing problem"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_camera_that_is_not_enumerated_is_still_offered() {
+        let mut options = vec![("Built-in".to_string(), "/dev/video0".to_string())];
+
+        ensure_configured_source_listed(&mut options, "/dev/video9");
+
+        assert_eq!(options.len(), 2);
+        assert_eq!(
+            options[1],
+            (
+                "/dev/video9 (configured)".to_string(),
+                "/dev/video9".to_string()
+            ),
+            "a camera that is unplugged right now must not silently change"
+        );
+    }
+
+    #[test]
+    fn an_enumerated_camera_is_not_listed_twice() {
+        let mut options = vec![("Built-in".to_string(), "/dev/video0".to_string())];
+
+        ensure_configured_source_listed(&mut options, "/dev/video0");
+        ensure_configured_source_listed(&mut options, "  /dev/video0  ");
+
+        assert_eq!(options.len(), 1);
+    }
+
+    #[test]
+    fn an_unset_camera_adds_no_option() {
+        let mut options = vec![("Built-in".to_string(), "/dev/video0".to_string())];
+
+        ensure_configured_source_listed(&mut options, "");
+        ensure_configured_source_listed(&mut options, "   ");
+
+        assert_eq!(options.len(), 1);
+    }
+
+    #[test]
+    fn resolve_current_user_ignores_empty_environment_values() {
+        assert_eq!(
+            resolve_current_user(Some(String::new()), Some("alice".into())),
+            "alice",
+            "an empty SUDO_USER must not win over USER"
+        );
+        assert_eq!(
+            resolve_current_user(Some(String::new()), Some(String::new())),
+            "root"
+        );
+        assert_eq!(resolve_current_user(None, None), "root");
+        assert_eq!(resolve_current_user(None, Some("bob".into())), "bob");
+    }
+
+    #[test]
+    fn showing_the_config_stays_unprivileged_while_editing_it_does_not() {
+        assert_eq!(
+            command_requires_root(&Commands::Config { show: true }),
+            None,
+            "reading the config is not a privileged operation"
+        );
+        assert_eq!(
+            command_requires_root(&Commands::Config { show: false }),
+            Some("config")
+        );
+    }
+
+    #[test]
+    fn only_the_commands_that_name_a_user_have_a_target() {
+        assert_eq!(
+            command_target_user(&Commands::Auth {
+                user: Some("alice".into()),
+                verbose: false,
+                silent: false,
+            }),
+            Some("alice")
+        );
+        assert_eq!(
+            command_target_user(&Commands::ListFaces {
+                user: Some("bob".into())
+            }),
+            Some("bob")
+        );
+        assert_eq!(
+            command_target_user(&Commands::Auth {
+                user: None,
+                verbose: false,
+                silent: false,
+            }),
+            None
+        );
+        assert_eq!(
+            command_target_user(&Commands::Config { show: true }),
+            None,
+            "config is never run against another account"
+        );
+    }
+
+    #[test]
+    fn which_finds_a_real_binary_and_not_an_invented_one() {
+        assert!(which("sh"), "sh must exist wherever the uninstaller runs");
+        assert!(!which("gaze-definitely-not-a-real-binary"));
+    }
+
+    #[test]
+    fn the_escalation_marker_is_passed_through_to_the_re_executed_process() {
+        assert_eq!(ESCALATION_MARKER, "GAZE_ESCALATED");
+        assert!(
+            ESCALATION_PRESERVED_ENV.contains(&"XDG_RUNTIME_DIR"),
+            "the session bus address is derived from XDG_RUNTIME_DIR, so sudo must keep it"
+        );
+    }
+
+    #[test]
+    fn re_execution_refuses_to_loop_when_it_is_already_escalated() {
+        if std::env::var_os(ESCALATION_MARKER).is_none() {
+            return;
+        }
+        let err = reexec_as_root("add-face").expect_err("a second escalation would loop forever");
+        assert!(err.to_string().contains("did not gain root privileges"));
+    }
+
+    #[test]
+    fn the_gnome_cleanup_commands_are_valid_shell() {
+        for (label, command) in [
+            ("gnome user settings", reset_gnome_user_settings_cmd()),
+            ("gdm dconf overrides", remove_gdm_dconf_overrides_cmd()),
+            ("gnome system settings", refresh_gnome_system_settings_cmd()),
+        ] {
+            is_valid_shell(&command).unwrap_or_else(|e| panic!("invalid {label} command: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_distro_cleanup_commands_are_valid_shell() {
+        for (label, command) in [
+            ("authselect restore", restore_authselect_cmd()),
+            ("arch pam", remove_arch_pam_configuration_cmd()),
+            ("pacman packages", remove_pacman_packages_cmd()),
+            ("zypper packages", remove_zypper_packages_cmd()),
+            ("suse pam", remove_suse_pam_configuration_cmd()),
+            ("zypper repo and key", remove_zypper_repo_and_key_cmd()),
+        ] {
+            is_valid_shell(&command).unwrap_or_else(|e| panic!("invalid {label} command: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_uninstall_step_is_valid_shell() {
+        for keep_data in [true, false] {
+            for (label, command) in build_uninstall_plan(keep_data) {
+                is_valid_shell(&command).unwrap_or_else(|e| {
+                    panic!("invalid step {label:?} (keep_data={keep_data}): {e}")
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn the_uninstall_plan_has_no_duplicate_or_unlabelled_steps() {
+        let plan = build_uninstall_plan(false);
+        assert!(!plan.is_empty());
+
+        let mut labels: Vec<&str> = plan.iter().map(|(label, _)| *label).collect();
+        let before = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "the plan repeats a step label");
+
+        for (label, command) in &plan {
+            assert!(
+                !label.is_empty(),
+                "every step needs a label to show the user"
+            );
+            assert!(
+                !command.trim().is_empty(),
+                "step {label:?} has nothing to run"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gnome_extension_uuid_is_spelled_the_same_way_everywhere() {
+        for command in [
+            reset_gnome_user_settings_cmd(),
+            remove_unmanaged_install_artifacts_cmd(),
+        ] {
+            assert!(
+                command.contains("gaze@gundulabs.com"),
+                "the shell cleanup must target the packaged extension uuid: {command}"
+            );
+        }
     }
 }
