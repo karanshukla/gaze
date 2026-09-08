@@ -806,7 +806,7 @@ kde-harness service="kde-fingerprint" rounds="1" confdir="":
     echo "built dist/kde-pam-harness"
     confdir='{{ confdir }}'
     if [ "$confdir" = self ]; then
-        cargo build --release -p pam-gaze
+        {{ opencv_env }} cargo build --release -p pam-gaze
         # A space-free directory, because a PAM config field cannot quote a path.
         confdir=$(mktemp -d /tmp/gaze-kde-harness.XXXXXX)
         trap 'rm -rf "$confdir"' EXIT
