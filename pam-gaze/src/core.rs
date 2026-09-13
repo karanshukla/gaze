@@ -20,6 +20,7 @@ pub const PAM_AUTH_ERR: c_int = 7;
 pub const PAM_SERVICE_ERR: c_int = 3;
 pub const PAM_CONV: c_int = 5;
 pub const PAM_SERVICE: c_int = 1;
+pub const PAM_RHOST: c_int = 4;
 pub const PAM_AUTHTOK: c_int = 6;
 pub const PAM_TEXT_INFO: c_int = 4;
 pub const PAM_ERROR_MSG: c_int = 3;
@@ -80,19 +81,18 @@ pub use gaze_core::dbus::{
     GAZE_REQUIRE_CONFIRMATION,
 };
 
-pub fn is_service_internal(service: &str, internal_list: &[String]) -> bool {
-    let service_name = std::path::Path::new(service.trim())
+fn pam_service_name(service: &str) -> &str {
+    std::path::Path::new(service.trim())
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or(service.trim());
+        .unwrap_or(service.trim())
+}
 
-    internal_list.iter().any(|item| {
-        let item_name = std::path::Path::new(item.trim())
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(item.trim());
-        item_name == service_name
-    })
+pub fn is_service_internal(service: &str, internal_list: &[String]) -> bool {
+    let service_name = pam_service_name(service);
+    internal_list
+        .iter()
+        .any(|item| pam_service_name(item) == service_name)
 }
 
 pub fn internal_give_up_message(status: Option<gaze_core::dbus::CaptureStatus>) -> &'static str {
@@ -780,16 +780,37 @@ pub fn get_user_uid(username: &str) -> Option<u32> {
 }
 
 pub unsafe fn get_pam_service(pamh: PamHandle) -> Option<String> {
-    let mut service_ptr: *const c_void = std::ptr::null();
-    let ret = unsafe { pam_get_item(pamh, PAM_SERVICE, &mut service_ptr) };
-    if ret != PAM_SUCCESS || service_ptr.is_null() {
+    unsafe { get_pam_string(pamh, PAM_SERVICE) }
+}
+
+pub unsafe fn get_pam_rhost(pamh: PamHandle) -> Option<String> {
+    unsafe { get_pam_string(pamh, PAM_RHOST) }
+}
+
+unsafe fn get_pam_string(pamh: PamHandle, item_type: c_int) -> Option<String> {
+    let mut item_ptr: *const c_void = std::ptr::null();
+    let ret = unsafe { pam_get_item(pamh, item_type, &mut item_ptr) };
+    if ret != PAM_SUCCESS || item_ptr.is_null() {
         return None;
     }
     unsafe {
-        CStr::from_ptr(service_ptr as *const c_char)
+        CStr::from_ptr(item_ptr as *const c_char)
             .to_str()
             .ok()
             .map(|s| s.to_owned())
+    }
+}
+
+pub fn caller_is_remote(rhost: Option<&str>) -> bool {
+    match rhost {
+        None => false,
+        Some(host) => {
+            let host = host.trim();
+            !matches!(
+                host,
+                "" | "localhost" | "localhost.localdomain" | "127.0.0.1" | "::1"
+            )
+        }
     }
 }
 
@@ -842,10 +863,11 @@ fn pam_auth_line_runs_gaze(line: &str) -> bool {
         return false;
     }
     fields.any(|field| {
-        GAZE_PAM_MODULES.iter().any(|module| {
-            // NixOS writes an absolute store path, not a bare module name.
-            field == *module || field.ends_with(&format!("/{module}"))
-        })
+        // NixOS writes an absolute store path, not a bare module name.
+        field
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| GAZE_PAM_MODULES.contains(&name))
     })
 }
 
@@ -888,6 +910,33 @@ pub fn service_retries_transient_give_up(service: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_logins_are_not_face_authenticated() {
+        for rhost in [
+            "192.168.1.120",
+            "mail.example.com",
+            "2001:db8::1",
+            "10.0.0.4",
+        ] {
+            assert!(caller_is_remote(Some(rhost)), "{rhost}");
+        }
+    }
+
+    #[test]
+    fn local_callers_are_face_authenticated() {
+        for rhost in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("localhost"),
+            Some("localhost.localdomain"),
+            Some("127.0.0.1"),
+            Some("::1"),
+        ] {
+            assert!(!caller_is_remote(rhost), "{rhost:?}");
+        }
+    }
 
     // The escape moves up a line and clears it, so it must only run when a line was printed.
     #[test]

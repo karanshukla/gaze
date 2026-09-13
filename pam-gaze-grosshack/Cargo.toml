@@ -3,7 +3,7 @@
 
 [package]
 name = "pam-gaze-grosshack"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Deprecated compatibility shim for Gaze simultaneous PAM module"
 categories.workspace = true
@@ -18,7 +18,7 @@ repository.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-gaze-core = { path = "../gaze-core", default-features = false }
+gaze-core = { path = "../gaze-core" }
 libc = "0.2.189"
 zbus = "5.19.0"
 tokio = { version = "1.53.1", features = ["full"] }
@@ -27,4 +27,4 @@ anyhow = "1.0.104"
 futures = "0.3.34"
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["full", "test-util"] }
+tokio = { version = "=1.53.1", features = ["full", "test-util"] }
