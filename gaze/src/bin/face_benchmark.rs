@@ -28,8 +28,8 @@ mod tpm;
 mod users;
 
 use gaze_core::config::{Config, MODELS_DIR, USERS_DIR};
-use gaze_core::detect::FaceDetector;
-use gaze_core::face::Spectrum;
+use gaze_vision::detect::FaceDetector;
+use gaze_vision::face::Spectrum;
 use recognize::FaceRecognizer;
 use std::path::{Path, PathBuf};
 use users::UserDatabase;
