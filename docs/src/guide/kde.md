@@ -255,6 +255,16 @@ login there is no password to reuse, so KWallet prompts you for one once, in the
 session. `success=done` keeps that prompt out of the greeter itself, where it
 would otherwise appear as a second password box.
 
+The same applies to oo7, which Fedora 45 makes the default Secret Service
+provider. `pam_oo7` also unlocks the keyring with the password captured at login,
+so after a face login it has nothing to unlock with either.
+
+If you type your password at the greeter and your face matches first, the
+session still starts through Gaze, which runs ahead of `pam_unix`, so the
+password is never checked. Plasma Login Manager keeps what you typed and hands it
+to `pam_kwallet5` when it asks, so KWallet unlocks anyway. A mistyped password
+there logs you in by face and leaves the wallet locked.
+
 Nothing to do on the lock screen: KWallet only unlocks at login.
 :::
 
