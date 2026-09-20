@@ -415,9 +415,8 @@ fn confirm_from_tty(prompt: PromptLine) -> Option<bool> {
 fn tty_confirmation(read: usize, key: u8) -> bool {
     read != 0 && matches!(key, b'\n' | b'\r')
 }
-// isatty(STDIN_FILENO) would miss a real controlling terminal whenever stdin is
-// redirected, e.g. `echo 1 | sudo tee /tmp/1`; opening /dev/tty directly is how
-// sudo itself finds the terminal to prompt on.
+// isatty(STDIN_FILENO) misses a real controlling terminal whenever stdin is redirected, e.g.
+// `echo 1 | sudo tee /tmp/1`; opening /dev/tty is how sudo itself finds the terminal.
 fn open_interactive_tty() -> Option<std::fs::File> {
     OpenOptions::new()
         .read(true)
@@ -653,9 +652,21 @@ pub async fn setup_auth_env() -> Result<(Config, GazeProxy<'static>), c_int> {
         .await
         .map_err(|_| PAM_SERVICE_ERR)?;
     let config = match gaze_core::dbus::try_load_config_from_daemon(&proxy).await {
-        Ok(Some(config)) => config,
+        Ok(Some(mut config)) => {
+            // The legacy Config property omits this flag.
+            // VerifyStartForKeyring checks active prerequisites before authentication.
+            config.storage.unlock_gnome_keyring = Config::load()
+                .unwrap_or_default()
+                .storage
+                .unlock_gnome_keyring;
+            config.clamp_keyring();
+            config
+        }
         Ok(None) => {
-            gaze_core::config::Config::load_from(gaze_core::config::CONFIG_PATH).unwrap_or_default()
+            let mut config = Config::load_from(gaze_core::config::CONFIG_PATH).unwrap_or_default();
+            // An incompatible daemon cannot support credential release.
+            config.storage.unlock_gnome_keyring = false;
+            config
         }
         Err(_) => return Err(PAM_SERVICE_ERR),
     };
@@ -674,7 +685,7 @@ pub async fn has_enrolled_faces_on(proxy: &GazeProxy<'_>, username: &str) -> any
 pub async fn has_enrolled_faces(username: &str) -> anyhow::Result<bool> {
     let (_config, proxy) = setup_auth_env()
         .await
-        .map_err(|e| anyhow::anyhow!("PAM error: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("PAM error: {e}"))?;
     has_enrolled_faces_on(&proxy, username).await
 }
 
@@ -754,7 +765,15 @@ fn auth_outcome(
 async fn request_verify_start(
     proxy: &GazeProxy<'static>,
     service: Option<&str>,
+    require_keyring: bool,
 ) -> anyhow::Result<()> {
+    if require_keyring {
+        // No legacy fallback: older daemons cannot guarantee the active prerequisites.
+        return proxy
+            .verify_start_for_keyring()
+            .await
+            .map_err(|e| anyhow::anyhow!("Keyring verification start failed: {e}"));
+    }
     match proxy
         .verify_start_for("any", service.unwrap_or_default())
         .await
@@ -765,9 +784,9 @@ async fn request_verify_start(
             proxy
                 .verify_start("any")
                 .await
-                .map_err(|e| anyhow::anyhow!("Verify start failed: {}", e))
+                .map_err(|e| anyhow::anyhow!("Verify start failed: {e}"))
         }
-        other => other.map_err(|e| anyhow::anyhow!("Verify start failed: {}", e)),
+        other => other.map_err(|e| anyhow::anyhow!("Verify start failed: {e}")),
     }
 }
 
@@ -775,6 +794,7 @@ pub async fn authenticate_biometric_with_status_on_and_notify<F>(
     proxy: &GazeProxy<'static>,
     username: &str,
     service: Option<&str>,
+    require_keyring: bool,
     on_status: F,
 ) -> anyhow::Result<(AuthOutcome, Option<gaze_core::dbus::CaptureStatus>)>
 where
@@ -793,12 +813,12 @@ where
     let mut verify_stream = proxy
         .receive_verify_status()
         .await
-        .map_err(|e| anyhow::anyhow!("Stream failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Stream failed: {e}"))?;
     let mut face_stream = proxy
         .receive_face_status()
         .await
-        .map_err(|e| anyhow::anyhow!("Stream failed: {}", e))?;
-    request_verify_start(proxy, service).await?;
+        .map_err(|e| anyhow::anyhow!("Stream failed: {e}"))?;
+    request_verify_start(proxy, service, require_keyring).await?;
 
     use futures::StreamExt;
     let mut last_status: Option<gaze_core::dbus::CaptureStatus> = None;
@@ -832,8 +852,16 @@ pub async fn authenticate_biometric_with_status_on(
     proxy: &GazeProxy<'static>,
     username: &str,
     service: Option<&str>,
+    require_keyring: bool,
 ) -> anyhow::Result<(AuthOutcome, Option<gaze_core::dbus::CaptureStatus>)> {
-    authenticate_biometric_with_status_on_and_notify(proxy, username, service, |_| {}).await
+    authenticate_biometric_with_status_on_and_notify(
+        proxy,
+        username,
+        service,
+        require_keyring,
+        |_| {},
+    )
+    .await
 }
 
 pub fn get_user_uid(username: &str) -> Option<u32> {
@@ -1529,18 +1557,16 @@ mod tests {
     fn pam_internal_confirmation_strictly_requires_gaze_confirmed() {
         use gaze_core::dbus::GAZE_CONFIRMED;
 
-        // In internal mode, only GAZE_CONFIRMED is accepted
         assert!(internal_confirmation_accepted(Some(GAZE_CONFIRMED)));
         assert!(internal_confirmation_accepted(Some("  GAZE_CONFIRMED\n")));
         assert!(internal_confirmation_accepted(Some("GAZE_CONFIRMED\r\n")));
 
-        // Empty string / ENTER (which human users press in standard mode) must be rejected in internal mode!
+        // A bare ENTER confirms in standard mode, so internal mode must not accept it.
         assert!(!internal_confirmation_accepted(Some("")));
         assert!(!internal_confirmation_accepted(Some("\n")));
         assert!(!internal_confirmation_accepted(Some("   ")));
         assert!(!internal_confirmation_accepted(None));
 
-        // Other responses rejected
         assert!(!internal_confirmation_accepted(Some("yes")));
         assert!(!internal_confirmation_accepted(Some("GAZE_CANCEL")));
         assert!(!internal_confirmation_accepted(Some("gaze_confirmed")));

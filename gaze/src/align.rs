@@ -4,7 +4,7 @@
 use image::RgbImage;
 use nalgebra::Matrix3;
 
-/// Standard 112x112 ArcFace alignment template, taken from InsightFace's `arcface_dst` in face_align.py.
+/// Standard 112x112 ArcFace alignment template, from InsightFace's `arcface_dst` in face_align.py.
 pub const ARCFACE_SRC_PTS: [[f32; 2]; 5] = [
     [38.2946, 51.6963],
     [73.5318, 51.5014],
@@ -96,6 +96,8 @@ pub fn umeyama(src: &[[f32; 2]; 5], dst: &[[f32; 2]; 5]) -> Option<Matrix3<f32>>
 
 pub fn warp_affine(img: &RgbImage, transform: &Matrix3<f32>, width: u32, height: u32) -> RgbImage {
     let mut out = RgbImage::new(width, height);
+    // The transform maps camera coordinates to the aligned face; sample through its inverse
+    // so every output pixel gets a source location instead of leaving gaps when scaling up.
     let inv = transform.try_inverse().unwrap_or(Matrix3::identity());
 
     for y in 0..height {

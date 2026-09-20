@@ -27,11 +27,11 @@ pub enum UserDbError {
 impl std::fmt::Display for UserDbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UserDbError::UserNotFound(username) => write!(f, "User '{}' not found", username),
-            UserDbError::FaceNotFound(face_name) => write!(f, "Face '{}' not found", face_name),
-            UserDbError::FaceExists(face_name) => write!(f, "Face '{}' already exists", face_name),
-            UserDbError::InvalidName(msg) => write!(f, "{}", msg),
-            UserDbError::Io(err) => write!(f, "{}", err),
+            UserDbError::UserNotFound(username) => write!(f, "User '{username}' not found"),
+            UserDbError::FaceNotFound(face_name) => write!(f, "Face '{face_name}' not found"),
+            UserDbError::FaceExists(face_name) => write!(f, "Face '{face_name}' already exists"),
+            UserDbError::InvalidName(msg) => write!(f, "{msg}"),
+            UserDbError::Io(err) => write!(f, "{err}"),
         }
     }
 }
@@ -162,6 +162,8 @@ impl UserDatabase {
             })?;
             cipher.decrypt(&raw)?
         } else if self.cipher.is_some() {
+            // Plaintext here would bypass AES-GCM authentication and allow an unauthenticated
+            // template into the encrypted store; it must go through explicit migration instead.
             anyhow::bail!(
                 "{} is not encrypted but template encryption is enabled",
                 path.display()
@@ -348,6 +350,8 @@ impl UserDatabase {
     ) -> anyhow::Result<usize> {
         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
 
+        // Stage every conversion before replacing originals so a bad key or conversion error
+        // leaves them untouched. The later renames are atomic per file, not across the store.
         let staging = (|| -> anyhow::Result<()> {
             for path in self.collect_bin_files()? {
                 let Some(bytes) = recode(&fs::read(&path)?)? else {
@@ -615,6 +619,8 @@ impl UserDatabase {
                     continue;
                 }
 
+                // Unit-norm embeddings make this dot product cosine similarity, which decides
+                // the match. The later percentage is for display, not an identity probability.
                 let score = embed.dot(ref_embed);
                 best = Some(match best {
                     Some(current)

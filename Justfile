@@ -755,6 +755,7 @@ test:
     @{{ gui_notice }}
     {{ opencv_env }} {{ ort_env }} cargo test --workspace {{ gui_exclude }} --release
     {{ opencv_env }} cargo test -p gaze-core --release --features gaze-core/openvino-config config::
+    bash scripts/test-keyring-pam.sh
 
 # Run the OpenVINO-gated tests with an OpenVINO-enabled system ONNX Runtime.
 [group("checks")]
@@ -767,7 +768,7 @@ test-openvino:
 audit:
     cargo audit
 
-# Verify the PAM modules link nothing beyond libc and friends
+# Verify PAM links only system libraries and the main module's TPM libraries
 [group("checks")]
 check-pam-link:
     scripts/check-pam-link.sh target/release/libpam_gaze.so target/release/libpam_gaze_grosshack.so

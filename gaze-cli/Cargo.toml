@@ -3,7 +3,7 @@
 
 [package]
 name = "gaze-cli"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "Command-line facial authentication client for Gaze"
 categories.workspace = true
@@ -23,6 +23,7 @@ name = "gaze"
 path = "src/main.rs"
 
 [dependencies]
+gaze-security = { path = "../gaze-security" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }

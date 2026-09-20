@@ -11,9 +11,9 @@ You do not need to enable this extension for the CLI, the GUI, or normal PAM pro
 
 > [!IMPORTANT]
 > If you enable `require_confirmation_lock_screen = true` or `require_confirmation_elevation = true` in `/etc/gaze/config.toml`, this GNOME Shell Extension **must** be enabled for face-authorization confirmation to function inside GNOME's graphical PolKit prompts and on the lock screen / GDM login screen.
-> 
+>
 > **Why this is required:** Standard GNOME PolKit prompt windows and lock screen prompts do not natively allow clicking confirmation buttons with an empty or blank password field. The GNOME Shell Extension solves this by dynamically intercepting Gaze's confirmation signals, automatically hiding the password entry, and focusing the confirmation button (the native "Authenticate" button in PolKit and a dedicated "Confirm Face Unlock" button on the lock screen and GDM login dialog).
-> 
+>
 > If the extension is **inactive/disabled** under GNOME while either toggle is set, Gaze's PAM modules will **safely bypass confirmation** (returning success instantly upon face match) to prevent empty input hangs and user lockouts.
 
 ## Should I enable it?
@@ -114,6 +114,68 @@ This is mostly about GNOME keyring behavior. GNOME keyring is normally unlocked 
 
 When that happens, apps that read saved secrets (browser credentials, git credentials, Wi-Fi secrets, chat clients, etc.) can keep prompting for a keyring password until you unlock it manually.
 
+### Optional TPM-backed keyring unlock
+
+Enable TPM template encryption, liveness, and GNOME Keyring unlock in `gaze config`.
+Then enroll the login keyring password:
+
+```bash
+gaze keyring
+```
+
+The password is stored in a root-only TPM-protected record. It is not sent over
+DBus. Re-enroll it after changing the account or keyring password.
+
+To remove the stored record, run `gaze keyring --forget`. `gaze clear-user` also
+removes it. An administrator can act on another account with
+`sudo gaze keyring --user <name>`.
+
+Enable [GDM face login](#optional-enable-face-at-gdm-login) separately. If you
+maintain your own `gdm-face` file, use this auth order, and keep the session line:
+
+```pam
+auth    required   pam_env.so
+auth    [success=1 default=ignore] pam_gaze.so
+auth    requisite  pam_deny.so
+auth    optional   pam_gnome_keyring.so use_authtok
+
+session optional   pam_gnome_keyring.so auto_start
+```
+
+The auth hook saves the token; the `session` hook starts and unlocks the keyring. This only works with `pam_gaze.so` in its default sequential mode; the
+`simultaneous` option does not supply the token.
+
+Gaze sets `PAM_AUTHTOK` only after face and liveness authentication succeeds. If
+the TPM, record, or password binding is unavailable, GDM falls back to the normal
+password login. A user who has not run `gaze keyring` logs in normally and is
+prompted for the keyring as before. Clearing the TPM, or changing the account
+password, requires re-enrollment. Gaze cannot verify the keyring password during
+enrollment or detect a later keyring-only password change: an incorrect or stale
+password leaves the keyring locked and requires a manual unlock and re-enrollment.
+
+### What this changes about your security
+
+Read this before turning it on.
+
+- **The record is recoverable by root on this machine.** Sealing has no PCR
+  policy, so anyone who can run code as root here — including someone who boots
+  another OS from a USB stick against an unencrypted disk — can unseal the key
+  and recover the plaintext password. It protects a *stolen disk*, not a machine
+  someone else can boot. Enable full-disk encryption if that matters to you.
+- **The password becomes visible to the rest of the `gdm-face` stack.** Once
+  `PAM_AUTHTOK` is set, every later module in that service can read it, including
+  the distribution-managed `postlogin`, `system-auth` and `common-session`
+  includes. Linux-PAM wipes it when the service ends.
+- **Face becomes equivalent to your password at the login screen.** Without this
+  option a face login gives an attacker a desktop session; with it, it also gives
+  them everything in your keyring.
+
+### Upgrading from an earlier Gaze
+
+`/etc/pam.d/gdm-face` is preserved across package upgrades, so an existing
+install keeps the stack that predates this feature and the unlock silently never
+happens. Run `sudo gaze doctor`: it reports the stale file and how to replace it.
+
 ## Optional: enable face at GDM login
 
 The easiest way is the **Enable face auth at GDM login** switch, under **Behavior → GDM login screen** in the [extension preferences](#open-the-extension-preferences). Toggling it triggers a polkit prompt, then the daemon writes `/etc/dconf/db/gdm.d/99-gaze` and runs `dconf update` for you.
@@ -146,6 +208,29 @@ Flip the **Enable face auth at GDM login** switch back off under **Behavior → 
 sudo rm -f /etc/dconf/db/gdm.d/99-gaze*
 sudo dconf update
 ```
+
+## Nothing appears at the GDM login screen
+
+If the lock screen works but the login screen never offers face auth, and the GDM
+journal shows nothing, check whether the greeter has extensions switched off:
+
+```bash
+sudo env DCONF_PROFILE=gdm XDG_CONFIG_HOME=/var/lib/gdm/seat0/config \
+  gsettings get org.gnome.shell disable-user-extensions
+```
+
+`true` means GNOME Shell stops its whole extension system in the greeter, so Gaze
+never loads there however it is configured. GDM's own dconf database holds the key
+and outranks every keyfile Gaze installs under `/etc/dconf/db/gdm.d`, so clear it
+at the source and reboot:
+
+```bash
+sudo rm -f /var/lib/gdm/seat0/config/dconf/user
+```
+
+GDM writes the file again with its own defaults. On Debian and Ubuntu the path is
+under `/var/lib/gdm3`, and a machine with more than one seat has one directory per
+seat. `gaze doctor` reports this and names the file for you.
 
 ## Verify GNOME flow
 

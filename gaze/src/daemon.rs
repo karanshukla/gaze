@@ -21,7 +21,7 @@ use crate::preview::PreviewStream;
 use crate::recognize::FaceRecognizer;
 use crate::users::{UserDatabase, UserDbError};
 use gaze_core::config::Config;
-use gaze_core::dbus::{CaptureStatus, EnrollPrompt, VerifyResult};
+use gaze_core::dbus::{CaptureStatus, DbusConfig, EnrollPrompt, VerifyResult};
 use gaze_core::ir::led::IrLed;
 use gaze_vision::camera::{Camera, CameraKind, resolve_configured_sources};
 use gaze_vision::detect::FaceDetector;
@@ -186,7 +186,7 @@ impl EmitterGuard {
                     Some(led)
                 }
                 None => {
-                    warn!("no IR emitter profile for {node}; continuing without illumination");
+                    warn!("No IR emitter profile for {node}; continuing without illumination");
                     None
                 }
             },
@@ -255,9 +255,29 @@ pub struct AuthDaemon {
     pub rt_handle: tokio::runtime::Handle,
 }
 
+fn validate_keyring_verification(
+    required: bool,
+    liveness: &gaze_core::config::LivenessConfig,
+    templates_encrypted: bool,
+) -> fdo::Result<()> {
+    gaze_core::config::StorageConfig {
+        encrypt_templates: templates_encrypted,
+        unlock_gnome_keyring: required,
+    }
+    .validate_keyring(liveness)
+    .map_err(|e| fdo::Error::Failed(format!("Keyring verification unavailable: {e}")))
+}
+
 fn resolve_config(loaded: anyhow::Result<Config>, last_good: &mut Config) -> Config {
     match loaded {
-        Ok(config) => {
+        Ok(mut config) => {
+            if config.clamp_keyring() {
+                warn!(
+                    path = CONFIG_PATH,
+                    "storage.unlock_gnome_keyring needs storage.encrypt_templates and \
+                     liveness.enabled; ignoring it"
+                );
+            }
             *last_good = config.clone();
             config
         }
@@ -409,6 +429,8 @@ impl AuthDaemon {
 
     fn read_ppid_at(base: &std::path::Path, pid: u32) -> Option<u32> {
         let stat = std::fs::read_to_string(base.join(pid.to_string()).join("stat")).ok()?;
+        // /proc/<pid>/stat encloses comm in parentheses, but comm itself may contain spaces
+        // and ')'. Split at the last ')' before counting the state and parent-PID fields.
         let after_comm = stat.rsplit_once(')')?.1;
         let mut fields = after_comm.split_whitespace();
         let _state = fields.next()?;
@@ -681,7 +703,8 @@ impl AuthDaemon {
         if let Some((active_uid, true, has_pipewire)) = active
             && (caller_uid == 0 || caller_uid == active_uid)
         {
-            // An active greeter holds the seat's camera ACL, so it outranks the target's leftover PipeWire socket.
+            // An active greeter holds the seat's camera ACL, so it outranks the target's
+            // leftover PipeWire socket.
             return Some(if has_pipewire {
                 CameraBinding::Session(active_uid)
                 // SDDM and Plasma Login Manager greeters have no `/run/user/<uid>` to bind to.
@@ -1000,6 +1023,56 @@ mod tests {
         config.auth.require_confirmation_lock_screen = true;
         config.auth.require_confirmation_elevation = true;
         config
+    }
+
+    #[test]
+    fn keyring_verification_uses_active_state_even_when_disk_settings_are_enabled() {
+        let mut disk = gaze_core::config::Config::default();
+        disk.storage.encrypt_templates = true;
+        disk.storage.unlock_gnome_keyring = true;
+        disk.liveness.enabled = true;
+        assert!(disk.storage.validate_keyring(&disk.liveness).is_ok());
+
+        for liveness in [false, true] {
+            for encryption in [false, true] {
+                let active_liveness = gaze_core::config::LivenessConfig {
+                    enabled: liveness,
+                    ..disk.liveness.clone()
+                };
+                assert_eq!(
+                    super::validate_keyring_verification(true, &active_liveness, encryption)
+                        .is_ok(),
+                    liveness && encryption
+                );
+                assert!(
+                    super::validate_keyring_verification(false, &active_liveness, encryption)
+                        .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hand_edited_keyring_opt_in_is_ignored_rather_than_breaking_face_login() {
+        let mut on_disk = gaze_core::config::Config::default();
+        on_disk.storage.unlock_gnome_keyring = true;
+        on_disk.storage.encrypt_templates = false;
+        on_disk.liveness.enabled = true;
+
+        let mut last_good = gaze_core::config::Config::default();
+        let resolved = super::resolve_config(Ok(on_disk), &mut last_good);
+        assert!(!resolved.storage.unlock_gnome_keyring);
+        assert!(
+            !last_good.storage.unlock_gnome_keyring,
+            "the clamped value is what gets remembered"
+        );
+
+        let mut valid = gaze_core::config::Config::default();
+        valid.storage.unlock_gnome_keyring = true;
+        valid.storage.encrypt_templates = true;
+        valid.liveness.enabled = true;
+        let resolved = super::resolve_config(Ok(valid), &mut last_good);
+        assert!(resolved.storage.unlock_gnome_keyring);
     }
 
     #[test]
@@ -1895,7 +1968,6 @@ mod tests {
     fn pam_internal_set_add_remove_clear_logic() {
         let set = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-        // Add services with normalization
         {
             let mut s = set.lock().unwrap();
             let norm = AuthDaemon::normalize_pam_service("/etc/pam.d/polkit-1");
@@ -1915,7 +1987,6 @@ mod tests {
             assert_eq!(s.len(), 2);
         }
 
-        // Remove service
         {
             let mut s = set.lock().unwrap();
             let norm = AuthDaemon::normalize_pam_service("polkit-1");
@@ -1929,7 +2000,6 @@ mod tests {
             assert_eq!(s.len(), 1);
         }
 
-        // Clear
         {
             let mut s = set.lock().unwrap();
             s.clear();
@@ -1944,7 +2014,7 @@ mod tests {
 
 pub use gaze_core::dbus::get_active_session_uid;
 
-/// The effective value in the GDM profile, which a NixOS configuration sets without our override file.
+/// The effective value in the GDM profile, which a NixOS config sets without our override file.
 fn gdm_face_auth_from_dconf() -> Option<bool> {
     if !std::path::Path::new(GDM_DCONF_PROFILE_PATH).exists() {
         return None;
@@ -2202,7 +2272,7 @@ fn hybrid_auth_passed(
         (true, true) => match policy {
             "or" => rgb_success || ir_success,
             "and" => rgb_success && ir_success,
-            // Fallback policy, where both spectra must pass unless RGB ran and was too dark to judge.
+            // Fallback policy: both spectra must pass unless RGB ran and was too dark to judge.
             _ => {
                 if !rgb_attempted {
                     rgb_success && ir_success
@@ -2733,7 +2803,7 @@ impl AuthDaemon {
         #[zbus(header)] header: Header<'_>,
         _face_name: String,
     ) -> fdo::Result<()> {
-        self.start_verification(ctxt, header, None).await
+        self.start_verification(ctxt, header, None, false).await
     }
 
     async fn verify_start_for(
@@ -2743,8 +2813,22 @@ impl AuthDaemon {
         _face_name: String,
         pam_service: String,
     ) -> fdo::Result<()> {
-        self.start_verification(ctxt, header, Some(pam_service))
+        self.start_verification(ctxt, header, Some(pam_service), false)
             .await
+    }
+
+    async fn verify_start_for_keyring(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.start_verification(ctxt, header, Some("gdm-face".into()), true)
+            .await
+    }
+
+    async fn keyring_enabled(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<bool> {
+        Self::ensure_config_read_access(&header).await?;
+        Ok(self.current_config().await.storage.unlock_gnome_keyring)
     }
 
     async fn verify_stop(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
@@ -3529,23 +3613,131 @@ impl AuthDaemon {
     }
 
     #[zbus(property(emits_changed_signal = "invalidates"))]
-    async fn config(&self, #[zbus(header)] header: Option<Header<'_>>) -> fdo::Result<Config> {
+    async fn config(&self, #[zbus(header)] header: Option<Header<'_>>) -> fdo::Result<DbusConfig> {
         let header =
             header.ok_or_else(|| fdo::Error::Failed("No message header provided".to_string()))?;
         Self::ensure_config_read_access(&header).await?;
-        Ok(self.current_config().await)
+        Ok(self.current_config().await.into())
     }
 
     #[zbus(property)]
     async fn set_config(
         &self,
         #[zbus(header)] header: Option<Header<'_>>,
-        new_config: Config,
+        new_config: DbusConfig,
     ) -> fdo::Result<()> {
         let header =
             header.ok_or_else(|| fdo::Error::Failed("No message header provided".to_string()))?;
         Self::ensure_authorized(&header, POLKIT_ACTION_MANAGE_CONFIG).await?;
 
+        let mut new_config: Config = new_config.into();
+        // Legacy clients do not send this flag; preserve the existing opt-in.
+        new_config.storage.unlock_gnome_keyring =
+            self.current_config().await.storage.unlock_gnome_keyring;
+        // A legacy client cannot see or clear the flag, so treat it as turning the feature off
+        // rather than rejecting every later write with an error it cannot act on.
+        if new_config.clamp_keyring() {
+            warn!(
+                "a legacy config update removed a keyring prerequisite; disabling GNOME Keyring unlock"
+            );
+        }
+        self.apply_config(new_config).await
+    }
+
+    async fn set_config_with_keyring(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+        #[zbus(header)] header: Header<'_>,
+        config: zbus::zvariant::OwnedValue,
+        unlock_gnome_keyring: bool,
+    ) -> fdo::Result<()> {
+        Self::ensure_authorized(&header, POLKIT_ACTION_MANAGE_CONFIG).await?;
+        let config = gaze_core::dbus::config_update_from_property(config, unlock_gnome_keyring)
+            .map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
+        self.apply_config(config).await?;
+        self.config_invalidate(&ctxt).await.map_err(Into::into)
+    }
+
+    async fn get_gdm_face_auth(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<bool> {
+        Self::ensure_config_read_access(&header).await?;
+        if let Some(enabled) = gdm_face_auth_from_dconf() {
+            return Ok(enabled);
+        }
+        Ok(std::path::Path::new(GDM_DCONF_OVERRIDE_PATH).exists())
+    }
+
+    async fn set_gdm_face_auth(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        enabled: bool,
+    ) -> fdo::Result<bool> {
+        Self::ensure_authorized(&header, POLKIT_ACTION_MANAGE_GDM_PROFILE).await?;
+
+        let path = std::path::Path::new(GDM_DCONF_OVERRIDE_PATH);
+        // Already in the requested state elsewhere, so don't write a read-only /etc.
+        if !path.exists() && gdm_face_auth_from_dconf() == Some(enabled) {
+            info!(enabled, "GDM face authentication already set outside Gaze");
+            return Ok(enabled);
+        }
+
+        if enabled {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| gdm_override_error("create", parent, e))?;
+            }
+            std::fs::write(path, GDM_DCONF_OVERRIDE_CONTENT)
+                .map_err(|e| gdm_override_error("write", path, e))?;
+        } else if path.exists() {
+            std::fs::remove_file(path).map_err(|e| gdm_override_error("remove", path, e))?;
+        }
+
+        let status = std::process::Command::new("dconf")
+            .arg("update")
+            .status()
+            .map_err(|e| fdo::Error::Failed(format!("Failed to run dconf update: {e}")))?;
+        if !status.success() {
+            return Err(fdo::Error::Failed(format!(
+                "dconf update exited with status {}",
+                status.code().unwrap_or(-1)
+            )));
+        }
+
+        info!(enabled, "Updated GDM face authentication override");
+        Ok(enabled)
+    }
+
+    #[zbus(signal)]
+    async fn verify_status(
+        ctxt: &SignalEmitter<'_>,
+        result: VerifyResult,
+        faces: Vec<(String, f64, f64, bool, f64, f64, bool)>,
+        rgb_status: CaptureStatus,
+        ir_status: CaptureStatus,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn verify_diagnostic(ctxt: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn face_status(ctxt: &SignalEmitter<'_>, status: CaptureStatus) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn preview_frame(ctxt: &SignalEmitter<'_>, jpeg: &[u8]) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn enroll_status(
+        ctxt: &SignalEmitter<'_>,
+        face_name: &str,
+        progress: u32,
+        max: u32,
+        is_done: bool,
+        msg: EnrollPrompt,
+        time_remaining: f64,
+    ) -> zbus::Result<()>;
+}
+
+impl AuthDaemon {
+    async fn apply_config(&self, new_config: Config) -> fdo::Result<()> {
         new_config
             .security
             .validate()
@@ -3726,90 +3918,12 @@ impl AuthDaemon {
         Ok(())
     }
 
-    async fn get_gdm_face_auth(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<bool> {
-        Self::ensure_config_read_access(&header).await?;
-        if let Some(enabled) = gdm_face_auth_from_dconf() {
-            return Ok(enabled);
-        }
-        Ok(std::path::Path::new(GDM_DCONF_OVERRIDE_PATH).exists())
-    }
-
-    async fn set_gdm_face_auth(
-        &self,
-        #[zbus(header)] header: Header<'_>,
-        enabled: bool,
-    ) -> fdo::Result<bool> {
-        Self::ensure_authorized(&header, POLKIT_ACTION_MANAGE_GDM_PROFILE).await?;
-
-        let path = std::path::Path::new(GDM_DCONF_OVERRIDE_PATH);
-        // Already in the requested state elsewhere, so don't write a read-only /etc.
-        if !path.exists() && gdm_face_auth_from_dconf() == Some(enabled) {
-            info!(enabled, "GDM face authentication already set outside Gaze");
-            return Ok(enabled);
-        }
-
-        if enabled {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| gdm_override_error("create", parent, e))?;
-            }
-            std::fs::write(path, GDM_DCONF_OVERRIDE_CONTENT)
-                .map_err(|e| gdm_override_error("write", path, e))?;
-        } else if path.exists() {
-            std::fs::remove_file(path).map_err(|e| gdm_override_error("remove", path, e))?;
-        }
-
-        let status = std::process::Command::new("dconf")
-            .arg("update")
-            .status()
-            .map_err(|e| fdo::Error::Failed(format!("Failed to run dconf update: {e}")))?;
-        if !status.success() {
-            return Err(fdo::Error::Failed(format!(
-                "dconf update exited with status {}",
-                status.code().unwrap_or(-1)
-            )));
-        }
-
-        info!(enabled, "Updated GDM face authentication override");
-        Ok(enabled)
-    }
-
-    #[zbus(signal)]
-    async fn verify_status(
-        ctxt: &SignalEmitter<'_>,
-        result: VerifyResult,
-        faces: Vec<(String, f64, f64, bool, f64, f64, bool)>,
-        rgb_status: CaptureStatus,
-        ir_status: CaptureStatus,
-    ) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn verify_diagnostic(ctxt: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn face_status(ctxt: &SignalEmitter<'_>, status: CaptureStatus) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn preview_frame(ctxt: &SignalEmitter<'_>, jpeg: &[u8]) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn enroll_status(
-        ctxt: &SignalEmitter<'_>,
-        face_name: &str,
-        progress: u32,
-        max: u32,
-        is_done: bool,
-        msg: EnrollPrompt,
-        time_remaining: f64,
-    ) -> zbus::Result<()>;
-}
-
-impl AuthDaemon {
     async fn start_verification(
         &self,
         ctxt: SignalEmitter<'_>,
         header: Header<'_>,
         pam_service: Option<String>,
+        require_keyring: bool,
     ) -> fdo::Result<()> {
         let claim = self.check_claim(&header).await?;
         self.ensure_auth_not_aborted(&header).await?;
@@ -3863,6 +3977,13 @@ impl AuthDaemon {
             ir_node = resolved;
         }
         let liveness_cfg = self.liveness_config.lock().await.clone();
+        // Check the state used by this attempt, not the Config property (which reads disk).
+        // This exact liveness snapshot is moved into the verification task below.
+        validate_keyring_verification(
+            require_keyring,
+            &liveness_cfg,
+            self.db.lock().await.is_encrypted(),
+        )?;
         let hybrid_policy = self.hybrid_policy.lock().await.clone();
         let serial_capture = *self.serial_capture.lock().await;
         let conn = ctxt.connection().clone();
@@ -4241,7 +4362,7 @@ impl AuthDaemon {
                                     logged_lit_luma = true;
                                 }
                             }
-                            // A gap between emitter strobes rather than a fault, so drop it silently.
+                            // A gap between emitter strobes, not a fault, so drop it silently.
                             IrFrameKind::StrobeDark => continue,
                             IrFrameKind::EmitterDark => {
                                 if !logged_dark_luma {

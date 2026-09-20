@@ -96,7 +96,6 @@ const fn const_index_of(options: &[&str], value: &str) -> u32 {
     panic!("option is not present in its own option list")
 }
 
-/// Index of `value` in `options`, or `fallback` when it is not listed.
 pub fn index_of(options: &[&str], value: &str, fallback: u32) -> u32 {
     options
         .iter()
@@ -105,7 +104,6 @@ pub fn index_of(options: &[&str], value: &str, fallback: u32) -> u32 {
         .unwrap_or(fallback)
 }
 
-/// Value at `index` in `options`, or `fallback` when the index is out of range.
 pub fn value_at(options: &[&'static str], index: usize, fallback: &'static str) -> &'static str {
     options.get(index).copied().unwrap_or(fallback)
 }
@@ -298,7 +296,7 @@ impl SecurityLevel {
                 _ => "det_500m.onnx",
             },
             other => {
-                tracing::warn!("invalid security level {other:?}; using medium detector");
+                tracing::warn!("Invalid security level {other:?}; using medium detector");
                 "det_500m.onnx"
             }
         }
@@ -313,7 +311,7 @@ impl SecurityLevel {
                 _ => "w600k_mbf.onnx",
             },
             other => {
-                tracing::warn!("invalid security level {other:?}; using medium recognizer");
+                tracing::warn!("Invalid security level {other:?}; using medium recognizer");
                 "w600k_mbf.onnx"
             }
         }
@@ -455,7 +453,7 @@ impl SecurityLevel {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, Value, OwnedValue, Type)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct Config {
     #[serde(default)]
     pub inference: InferenceConfig,
@@ -555,10 +553,34 @@ impl InferenceConfig {
 }
 
 // Its own table: a security preset replaces `[security]` wholesale, resetting it.
-#[derive(Deserialize, Serialize, Clone, Debug, Default, Value, OwnedValue, Type)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct StorageConfig {
     #[serde(default = "default_false")]
     pub encrypt_templates: bool,
+    #[serde(default = "default_false")]
+    pub unlock_gnome_keyring: bool,
+}
+
+impl Config {
+    /// Disable keyring unlock when prerequisites are missing. Returns whether it was cleared.
+    pub fn clamp_keyring(&mut self) -> bool {
+        if self.storage.validate_keyring(&self.liveness).is_err() {
+            self.storage.unlock_gnome_keyring = false;
+            return true;
+        }
+        false
+    }
+}
+
+impl StorageConfig {
+    pub fn validate_keyring(&self, liveness: &LivenessConfig) -> anyhow::Result<()> {
+        if self.unlock_gnome_keyring && (!self.encrypt_templates || !liveness.enabled) {
+            anyhow::bail!(
+                "storage.unlock_gnome_keyring requires storage.encrypt_templates and liveness.enabled"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Value, OwnedValue, Type)]
@@ -831,7 +853,7 @@ impl AuthConfig {
             "screen_lock" => "screen_lock",
             "" | "all" => "all",
             other => {
-                tracing::warn!("invalid start delay scope {other:?}; delaying every auth");
+                tracing::warn!("Invalid start delay scope {other:?}; delaying every auth");
                 "all"
             }
         }
@@ -847,7 +869,6 @@ impl AuthConfig {
         }
     }
 
-    /// Milliseconds to wait before face verification begins.
     pub fn effective_start_delay_ms(&self, resumed: bool, surface: AuthSurface) -> u64 {
         self.start_delay_after_lock_ms(resumed, surface, None)
     }
@@ -1374,7 +1395,7 @@ mod tests {
         assert_eq!(liveness.effective_max_frames(30.0), 60);
         assert_eq!(liveness.effective_max_frames(60.0), 120);
         assert_eq!(liveness.effective_max_frames(15.0), 30);
-        // Minimum frame floor
+        // Minimum frame floor.
         let short_liveness = LivenessConfig {
             max_seconds: 0.2,
             ..LivenessConfig::default()
@@ -1623,7 +1644,7 @@ mod tests {
 
     #[test]
     fn load_from_migrates_legacy_max_frames() {
-        // Case 1: default 40 frames migrates to 2.0s
+        // Case 1: default 40 frames migrates to 2.0s.
         let temp = TempDir::new("legacy-max-frames-40");
         let path = temp.path().join("config.toml");
         std::fs::write(
@@ -1640,7 +1661,7 @@ mod tests {
         assert!(on_disk.contains("max_seconds = 2.0"));
         assert!(!on_disk.contains("max_frames"));
 
-        // Case 2: custom non-40 frames migrates faithfully (e.g. 25 frames -> 0.83s)
+        // Case 2: custom non-40 frames migrates faithfully (e.g. 25 frames -> 0.83s).
         let temp2 = TempDir::new("legacy-max-frames-custom");
         let path2 = temp2.path().join("config.toml");
         std::fs::write(
@@ -1797,7 +1818,7 @@ mod tests {
         use zvariant::Type;
         assert_eq!(AuthConfig::SIGNATURE.to_string(), "(bbbbbtts)");
         assert_eq!(
-            Config::SIGNATURE.to_string(),
+            crate::dbus::DbusConfig::SIGNATURE.to_string(),
             "((ss)(sssdds)(ssbys)(bbbbbtts)(ud)(bdd)(b))"
         );
     }
@@ -1991,6 +2012,7 @@ mod tests {
             },
             storage: StorageConfig {
                 encrypt_templates: true,
+                unlock_gnome_keyring: true,
             },
         };
 
@@ -2026,6 +2048,7 @@ mod tests {
         assert_eq!(loaded.liveness.threshold, 0.9);
         assert_eq!(loaded.liveness.max_seconds, 2.5);
         assert!(loaded.storage.encrypt_templates);
+        assert!(loaded.storage.unlock_gnome_keyring);
     }
 
     #[test]
@@ -2101,8 +2124,10 @@ mod tests {
             String::new(),
         );
 
-        let value = zvariant::OwnedValue::try_from(cfg).unwrap();
-        let back = Config::try_from(value).unwrap();
+        let value = zvariant::OwnedValue::try_from(crate::dbus::DbusConfig::from(cfg)).unwrap();
+        let back = crate::dbus::DbusConfig::try_from(value)
+            .map(Config::from)
+            .unwrap();
 
         assert_eq!(back.auth.start_delay_ms, 4500);
         assert_eq!(back.auth.resume_grace_ms, 1500);
@@ -2390,6 +2415,42 @@ level = "low""#,
         )
         .unwrap();
         assert!(!absent.storage.encrypt_templates);
+    }
+
+    #[test]
+    fn keyring_defaults_off_and_requires_tpm_and_liveness() {
+        let mut config: Config =
+            toml_edit::de::from_str("[storage]\nencrypt_templates = true").unwrap();
+        assert!(!config.storage.unlock_gnome_keyring);
+        config.storage.unlock_gnome_keyring = true;
+        config.liveness.enabled = true;
+        assert!(config.storage.validate_keyring(&config.liveness).is_ok());
+        config.storage.encrypt_templates = false;
+        assert!(config.storage.validate_keyring(&config.liveness).is_err());
+        config.storage.encrypt_templates = true;
+        config.liveness.enabled = false;
+        assert!(config.storage.validate_keyring(&config.liveness).is_err());
+        config.storage.unlock_gnome_keyring = false;
+        assert!(config.storage.validate_keyring(&config.liveness).is_ok());
+        assert!(unknown_config_keys("[storage]\nunlock_gnome_keyring = false").is_empty());
+    }
+
+    #[test]
+    fn a_hand_edited_keyring_opt_in_without_prerequisites_clamps_off() {
+        let mut config = Config::default();
+        config.storage.unlock_gnome_keyring = true;
+        config.storage.encrypt_templates = true;
+        config.liveness.enabled = false;
+        assert!(config.clamp_keyring());
+        assert!(!config.storage.unlock_gnome_keyring);
+
+        config.storage.unlock_gnome_keyring = true;
+        config.liveness.enabled = true;
+        assert!(!config.clamp_keyring(), "a valid opt-in survives");
+        assert!(config.storage.unlock_gnome_keyring);
+
+        let mut off = Config::default();
+        assert!(!off.clamp_keyring(), "the default needs no clamping");
     }
 
     #[test]

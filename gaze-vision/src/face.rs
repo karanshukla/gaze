@@ -170,6 +170,8 @@ impl EnrollmentPoseStability {
 
         let stable_yaw = max_yaw - min_yaw < ENROLL_STABLE_YAW_RANGE;
         let stable_pitch = max_pitch - min_pitch < ENROLL_STABLE_PITCH_RANGE;
+        // Directional prompts allow movement along the requested axis; only the other axis
+        // must settle. Requiring both would reject the turn the user was asked to make.
         match prompt {
             EnrollPrompt::LookStraight => stable_yaw && stable_pitch,
             EnrollPrompt::LookUp | EnrollPrompt::LookDown => stable_yaw,
@@ -459,7 +461,7 @@ impl FaceChecker {
                         threshold: self.dark_luma_threshold,
                     });
 
-                    tracing::debug!("luma: {} avg_luma: {}", luma, avg_luma);
+                    tracing::debug!("Luma: {luma} avg_luma: {avg_luma}");
 
                     if !is_current_frame_dark {
                         CaptureStatus::Usable

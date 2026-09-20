@@ -53,6 +53,7 @@ max_seconds = 2.0
 
 [storage]
 encrypt_templates = false
+unlock_gnome_keyring = false
 ```
 
 ## Upgrades
@@ -409,6 +410,16 @@ Apply changes with:
 sudo systemctl restart gazed
 ```
 
+## Unlock GNOME Keyring after a GDM face login
+
+`storage.unlock_gnome_keyring` defaults to `false`. It requires TPM template
+encryption and liveness; if either is missing the option is ignored and the
+daemon logs why. Run `gaze keyring` for each user after enabling it — users who
+skip it keep logging in with face and are prompted for the keyring as before.
+Read the security notes in
+[GNOME Keyring setup](/guide/gnome#optional-tpm-backed-keyring-unlock) first:
+the stored password is recoverable by root on this machine.
+
 ## Enrollment behavior
 
 ```toml
@@ -438,7 +449,7 @@ Gaze supports enrolling face profiles for both RGB and IR cameras. Depending on 
 
 ### Upgrading Existing Profiles
 
-If you connect or configure an IR camera after you have already enrolled a face, your existing face profiles will only contain RGB captures. 
+If you connect or configure an IR camera after you have already enrolled a face, your existing face profiles will only contain RGB captures.
 - You can see which capture types exist for each face profile in the CLI (`gaze list-faces`) and the GUI settings window, which display `[RGB]` and `[IR]` badges: green when the profile covers that spectrum, amber when a camera is configured for it but the profile has no captures from it, and grey when no camera is configured for that spectrum at all.
 - To add the missing IR captures to an existing profile, ensure your IR camera is configured, and run:
   ```bash

@@ -22,6 +22,7 @@ const DAEMON_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(25);
 const BENCHMARK_TIMEOUT: Duration = Duration::from_secs(30);
 const PAM_MODULES: [&str; 2] = ["pam_gaze.so", "pam_gaze_grosshack.so"];
+const GAZE_BUS_NAME: &str = "com.gundulabs.Gaze";
 const GNOME_EXTENSION_ID: &str = "gaze@gundulabs.com";
 const GNOME_EXTENSION_SCHEMA: &str = "org.gnome.shell.extensions.gaze";
 const GNOME_DOCS_URL: &str = "https://gaze.gundulabs.com/guide/gnome";
@@ -46,6 +47,9 @@ const GDM_DCONF_PROFILE: &str = "gdm";
 const GDM_DCONF_PROFILE_PATH: &str = "/etc/dconf/profile/gdm";
 const GDM_DCONF_FACE_AUTH_KEY: &str = "/org/gnome/shell/extensions/gaze/enable-face-authentication";
 const GDM_ENABLED_EXTENSIONS_KEY: &str = "/org/gnome/shell/enabled-extensions";
+const GDM_DISABLE_EXTENSIONS_KEY: &str = "/org/gnome/shell/disable-user-extensions";
+/// Debian and Ubuntu name the account `gdm3`, everyone else `gdm`.
+const GDM_HOME_DIRS: [&str; 2] = ["/var/lib/gdm", "/var/lib/gdm3"];
 const GDM_COMPILED_DB_PATH: &str = "/etc/dconf/db/gdm";
 const GDM_FACE_PAM_SERVICE: &str = "gdm-face";
 const SELINUX_ENFORCE_PATH: &str = "/sys/fs/selinux/enforce";
@@ -65,9 +69,8 @@ const PRIVILEGED_FILES: [&str; 5] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Level {
     Pass,
-    /// A working feature the user has deliberately left switched off. Not a
-    /// problem, so it must not wear a checkmark, but it still carries the steps
-    /// that switch it on.
+    /// A working feature the user deliberately switched off: no checkmark, but it
+    /// still carries the steps that switch it on.
     Off,
     Warning,
     Error,
@@ -183,6 +186,7 @@ pub async fn run(username: &str, benchmark: bool) -> anyhow::Result<bool> {
     check_privileged_files(&mut report);
     check_desktop_integration(&mut report);
     check_tpm(&mut report, config.as_ref());
+    check_keyring(&mut report, username, config.as_ref());
     check_daemon(&mut report, username, config.as_ref(), benchmark).await;
 
     report.print()?;
@@ -201,13 +205,13 @@ fn check_platform(report: &mut Report) {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if gaze_core::cpu::supports_inference() {
             report.pass("CPU", "AVX2 is available");
         } else {
             report.error(
                 "CPU",
-                "AVX2 is unavailable; gazed cannot run on this CPU",
-                "Use a machine with AVX2 support. The CLI can run here, but the daemon cannot.",
+                gaze_core::cpu::UNSUPPORTED_CPU_MESSAGE,
+                gaze_core::cpu::UNSUPPORTED_CPU_FIX,
             );
         }
     }
@@ -306,21 +310,89 @@ fn extension_setting(key: &str) -> std::io::Result<(bool, String)> {
     command_output_env("gsettings", &["get", GNOME_EXTENSION_SCHEMA, key], &env)
 }
 
-fn gdm_system_dconf_read(key: &str) -> Option<String> {
-    let profile = std::env::temp_dir().join(format!(
-        "gaze-doctor-{}-{}.profile",
-        GDM_DCONF_PROFILE,
-        std::process::id()
-    ));
-    fs::write(&profile, format!("system-db:{GDM_DCONF_PROFILE}\n")).ok()?;
-    let result = command_output_env(
-        "dconf",
-        &["read", key],
-        &[("DCONF_PROFILE", profile.as_os_str())],
-    );
+/// `None` only when `dconf` itself could not answer. An unset key reads back as an empty
+/// string, which callers layering one db over another must tell apart from a real value.
+fn dconf_read_with_profile(
+    tag: &str,
+    profile_body: &str,
+    config_home: Option<&Path>,
+    key: &str,
+) -> Option<String> {
+    let profile =
+        std::env::temp_dir().join(format!("gaze-doctor-{tag}-{}.profile", std::process::id()));
+    fs::write(&profile, profile_body).ok()?;
+    let mut env: Vec<(&str, &OsStr)> = vec![("DCONF_PROFILE", profile.as_os_str())];
+    if let Some(home) = config_home {
+        env.push(("XDG_CONFIG_HOME", home.as_os_str()));
+    }
+    let result = command_output_env("dconf", &["read", key], &env);
     let _ = fs::remove_file(&profile);
     match result {
         Ok((true, value)) => Some(value.trim().to_string()),
+        _ => None,
+    }
+}
+
+fn gdm_system_dconf_read(key: &str) -> Option<String> {
+    dconf_read_with_profile(
+        GDM_DCONF_PROFILE,
+        &format!("system-db:{GDM_DCONF_PROFILE}\n"),
+        None,
+        key,
+    )
+}
+
+fn gdm_user_db_read(dir: &Path, key: &str) -> Option<String> {
+    dconf_read_with_profile("gdm-user", "user-db:user\n", Some(dir), key)
+        .filter(|value| !value.is_empty())
+}
+
+/// The greeter runs as `gdm` with its own `XDG_CONFIG_HOME`, and the path differs by
+/// distribution and by seat, so every candidate holding a db has to be considered.
+fn gdm_greeter_config_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for home in GDM_HOME_DIRS {
+        let home = Path::new(home);
+        if !home.is_dir() {
+            continue;
+        }
+        dirs.push(home.join(".config"));
+        if let Ok(entries) = fs::read_dir(home) {
+            for entry in entries.flatten() {
+                dirs.push(entry.path().join("config"));
+            }
+        }
+    }
+    dirs.retain(|dir| dir.join("dconf/user").is_file());
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// `user-db:user` leads the greeter profile, so whatever GDM has written for itself outranks
+/// every `system-db` keyfile. Reading only `system-db:gdm` reports what Gaze installed rather
+/// than what the greeter resolves, which is how a disabled extension system passed as ready.
+fn gdm_greeter_dconf_read(key: &str) -> Option<String> {
+    for dir in gdm_greeter_config_dirs() {
+        if let Some(value) = gdm_user_db_read(&dir, key) {
+            return Some(value);
+        }
+    }
+    gdm_system_dconf_read(key)
+}
+
+/// Which greeter db holds `key`, for a fix that has to name the file it must be cleared from.
+fn gdm_greeter_dconf_source(key: &str) -> Option<PathBuf> {
+    gdm_greeter_config_dirs()
+        .into_iter()
+        .find(|dir| gdm_user_db_read(dir, key).is_some())
+        .map(|dir| dir.join("dconf/user"))
+}
+
+fn dconf_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
         _ => None,
     }
 }
@@ -330,11 +402,7 @@ fn gdm_face_auth_from_dconf() -> Option<bool> {
     if !Path::new(GDM_DCONF_PROFILE_PATH).exists() {
         return None;
     }
-    match gdm_system_dconf_read(GDM_DCONF_FACE_AUTH_KEY)?.as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
+    dconf_bool(&gdm_greeter_dconf_read(GDM_DCONF_FACE_AUTH_KEY)?)
 }
 
 fn profile_reads_system_db(contents: &str, db: &str) -> bool {
@@ -354,6 +422,8 @@ enum GdmGreeterReadiness {
     ProfileMissingSystemDb,
     CompiledDbMissing,
     ExtensionNotEnabled,
+    /// `Some` names the greeter db holding the key, `None` means a `system-db` layer set it.
+    ExtensionsDisabled(Option<PathBuf>),
     Unverifiable(String),
 }
 
@@ -374,13 +444,29 @@ fn gdm_greeter_readiness() -> GdmGreeterReadiness {
         return GdmGreeterReadiness::CompiledDbMissing;
     }
 
-    match gdm_system_dconf_read(GDM_ENABLED_EXTENSIONS_KEY) {
-        Some(value) if extensions_include(&value, GNOME_EXTENSION_ID) => GdmGreeterReadiness::Ready,
-        Some(_) => GdmGreeterReadiness::ExtensionNotEnabled,
-        None => GdmGreeterReadiness::Unverifiable(
-            "`dconf read` against the GDM database failed".to_string(),
-        ),
+    match gdm_greeter_dconf_read(GDM_ENABLED_EXTENSIONS_KEY) {
+        Some(value) if extensions_include(&value, GNOME_EXTENSION_ID) => {}
+        Some(_) => return GdmGreeterReadiness::ExtensionNotEnabled,
+        None => {
+            return GdmGreeterReadiness::Unverifiable(
+                "`dconf read` against the GDM database failed".to_string(),
+            );
+        }
     }
+
+    // Checked after the list because it overrides it: gnome-shell stops its whole extension
+    // system, so the greeter loads nothing however the extension is enabled.
+    if gdm_greeter_dconf_read(GDM_DISABLE_EXTENSIONS_KEY)
+        .as_deref()
+        .and_then(dconf_bool)
+        == Some(true)
+    {
+        return GdmGreeterReadiness::ExtensionsDisabled(gdm_greeter_dconf_source(
+            GDM_DISABLE_EXTENSIONS_KEY,
+        ));
+    }
+
+    GdmGreeterReadiness::Ready
 }
 
 fn selinux_is_enforcing() -> bool {
@@ -1231,10 +1317,8 @@ fn gnome_prefs_path(group: &str, switch: &str) -> String {
     )
 }
 
-/// GNOME Shell only scans extension directories at session start. A running
-/// session asked to enable a UUID it has never scanned drops the entry again the
-/// next time it rewrites `enabled-extensions`, which is why a fresh install can
-/// look enabled right up until the first logout.
+/// GNOME Shell only scans extension directories at session start, so a session asked
+/// to enable a UUID it never scanned drops it at the next `enabled-extensions` rewrite.
 fn gnome_extension_enable_steps() -> String {
     format!(
         "1. Reboot, or log out and back in, so GNOME Shell scans the extension.\n\
@@ -1348,6 +1432,24 @@ fn check_desktop_integration(report: &mut Report) {
                         "the GDM database does not enable {GNOME_EXTENSION_ID} for the greeter, so the login screen never starts the {GDM_FACE_PAM_SERVICE} PAM service"
                     ),
                     "Reinstall the Gaze GNOME extension package, run `sudo dconf update`, then reboot.",
+                ),
+                GdmGreeterReadiness::ExtensionsDisabled(source) => report.error(
+                    "GDM login face auth",
+                    format!(
+                        "the greeter resolves `org.gnome.shell disable-user-extensions` to true, which switches off every GNOME Shell extension at the login screen, {GNOME_EXTENSION_ID} included"
+                    ),
+                    match source {
+                        Some(path) => format!(
+                            "{} holds that key and outranks every keyfile under /etc/dconf/db/gdm.d, so it has to be cleared there:\n\
+                             sudo rm -f {}\n\
+                             Then reboot. GDM writes the file again with its own defaults.",
+                            path.display(),
+                            path.display()
+                        ),
+                        None => format!(
+                            "Put `disable-user-extensions=false` under `[org/gnome/shell]` in {GDM_FACE_OVERRIDE_PATH}, run `sudo dconf update`, then reboot."
+                        ),
+                    },
                 ),
                 GdmGreeterReadiness::Unverifiable(why) => report.warning(
                     "GDM login face auth",
@@ -1600,6 +1702,157 @@ fn check_tpm(report: &mut Report, config: Option<&Config>) {
     );
 }
 
+fn pam_entry(line: &str) -> Option<(&str, &str, &str, &str)> {
+    let line = line.split('#').next()?.trim();
+    let (kind, rest) = line.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    // @include also affects auth; ignoring it would miscount pam_gaze's success=1 jump.
+    if kind == "@include" {
+        return Some(("auth", "include", rest, ""));
+    }
+    let (control, rest) = if rest.starts_with('[') {
+        rest.split_at(rest.find(']')? + 1)
+    } else {
+        rest.split_once(char::is_whitespace)?
+    };
+    let (module, options) = rest
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .unwrap_or((rest.trim_start(), ""));
+    let module = module.rsplit('/').next()?;
+    Some((kind.trim_start_matches('-'), control, module, options))
+}
+
+/// Recognize the packaged hand-off, including the session hook that starts the keyring.
+fn gdm_face_stack_passes_the_token(contents: &str) -> bool {
+    let entries: Vec<_> = contents.lines().filter_map(pam_entry).collect();
+    let auth: Vec<_> = entries.iter().filter(|entry| entry.0 == "auth").collect();
+    let handoff = auth.windows(3).any(|lines| {
+        let (_, control, module, options) = *lines[0];
+        module == "pam_gaze.so"
+            && control
+                .split_ascii_whitespace()
+                .eq(["[success=1", "default=ignore]"])
+            && !options
+                .split_ascii_whitespace()
+                .any(|option| option == "simultaneous")
+            && lines[1].1 == "requisite"
+            && lines[1].2 == "pam_deny.so"
+            && lines[2].1 == "optional"
+            && lines[2].2 == "pam_gnome_keyring.so"
+            && lines[2]
+                .3
+                .split_ascii_whitespace()
+                .any(|option| option == "use_authtok")
+            && !lines[2]
+                .3
+                .split_ascii_whitespace()
+                .any(|option| option == "auto_start" || option.starts_with("only_if="))
+    });
+    let session = entries.iter().any(|&(kind, control, module, options)| {
+        kind == "session"
+            && matches!(control, "optional" | "required")
+            && module == "pam_gnome_keyring.so"
+            && options
+                .split_ascii_whitespace()
+                .any(|option| option == "auto_start")
+            && !options
+                .split_ascii_whitespace()
+                .any(|option| option.starts_with("only_if="))
+    });
+    handoff && session
+}
+
+fn keyring_record_state(username: &str) -> Option<bool> {
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let uid = user_uid(username)?;
+    Some(
+        Path::new(gaze_security::keyring::STORE_DIR)
+            .join(format!("{uid}.keyring"))
+            .exists(),
+    )
+}
+
+fn check_keyring(report: &mut Report, username: &str, config: Option<&Config>) {
+    let Some(config) = config else {
+        return;
+    };
+    if !config.storage.unlock_gnome_keyring {
+        report.off(
+            "Keyring",
+            "GNOME Keyring unlock after a GDM face login is off",
+            format!(
+                "Turn it on: set `unlock_gnome_keyring = true` under [storage] in {CONFIG_PATH} \
+                 (it also needs `encrypt_templates = true` and [liveness] `enabled = true`), \
+                 restart gazed, then run `sudo gaze keyring`."
+            ),
+        );
+        return;
+    }
+
+    if let Err(err) = config.storage.validate_keyring(&config.liveness) {
+        report.error(
+            "Keyring",
+            format!("GNOME Keyring unlock is enabled but unusable: {err}"),
+            format!(
+                "Set `encrypt_templates = true` under [storage] and `enabled = true` under \
+                 [liveness] in {CONFIG_PATH}, or turn off `unlock_gnome_keyring`, then restart gazed."
+            ),
+        );
+        return;
+    }
+
+    match read_pam_service(&format!("/etc/pam.d/{GDM_FACE_PAM_SERVICE}")) {
+        Some(contents) if !gdm_face_stack_passes_the_token(&contents) => {
+            report.error(
+                "Keyring",
+                format!(
+                    "/etc/pam.d/{GDM_FACE_PAM_SERVICE} does not have the packaged keyring \
+                     hand-off and session hook"
+                ),
+                format!(
+                    "This file is preserved across upgrades. Replace it with the packaged stack \
+                     (look for /etc/pam.d/{GDM_FACE_PAM_SERVICE}.rpmnew, .pacnew or .dpkg-dist), \
+                     or edit it so pam_gaze.so uses `[success=1 default=ignore]` followed by \
+                     `auth requisite pam_deny.so` and `auth optional pam_gnome_keyring.so use_authtok`, \
+                     plus `session optional pam_gnome_keyring.so auto_start`."
+                ),
+            );
+            return;
+        }
+        None => {
+            report.error(
+                "Keyring",
+                format!("GNOME Keyring unlock is enabled but /etc/pam.d/{GDM_FACE_PAM_SERVICE} is missing"),
+                "Install the Gaze GNOME extension package, which ships the gdm-face PAM stack.",
+            );
+            return;
+        }
+        Some(_) => {}
+    }
+
+    match keyring_record_state(username) {
+        Some(true) => report.pass(
+            "Keyring",
+            format!("a TPM-protected keyring credential is enrolled for {username}"),
+        ),
+        Some(false) => report.warning(
+            "Keyring",
+            format!("GNOME Keyring unlock is enabled but {username} has no enrolled credential"),
+            format!("Run `sudo gaze keyring --user {username}`."),
+        ),
+        None => report.pass(
+            "Keyring",
+            format!(
+                "the {GDM_FACE_PAM_SERVICE} stack passes the token; run `sudo gaze doctor` to \
+                 also check whether {username} is enrolled"
+            ),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DaemonCredentials {
     uid: u32,
@@ -1689,6 +1942,15 @@ fn group_gid(name: &str) -> Option<u32> {
     Some(unsafe { (*entry).gr_gid })
 }
 
+fn user_uid(name: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+    if entry.is_null() {
+        return None;
+    }
+    Some(unsafe { (*entry).pw_uid })
+}
+
 fn user_name(uid: u32) -> String {
     let entry = unsafe { libc::getpwuid(uid) };
     if entry.is_null() {
@@ -1711,12 +1973,34 @@ async fn read_daemon_config(proxy: &GazeProxy<'_>, ready_wait: Duration) -> zbus
     let deadline = Instant::now() + ready_wait;
     loop {
         match proxy.config().await {
-            Ok(config) => return Ok(config),
+            Ok(config) => return Ok(config.into()),
             Err(err) if dbus_is_not_activatable(&err) && Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// Whether `gazed` currently owns its well-known name, retrying for `ready_wait` so a
+/// daemon still downloading models is not mistaken for one that will never appear.
+/// Connecting to the system bus succeeds regardless, so only this distinguishes the two.
+async fn gaze_name_has_owner(proxy: &GazeProxy<'_>, ready_wait: Duration) -> bool {
+    let Ok(dbus) = zbus::fdo::DBusProxy::new(proxy.inner().connection()).await else {
+        return false;
+    };
+    let Ok(name) = zbus::names::BusName::try_from(GAZE_BUS_NAME) else {
+        return false;
+    };
+    let deadline = Instant::now() + ready_wait;
+    loop {
+        if let Ok(true) = dbus.name_has_owner(name.clone()).await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -1726,10 +2010,11 @@ async fn check_daemon(
     config: Option<&Config>,
     benchmark: bool,
 ) {
-    let daemon_starting = matches!(
-        command_output("systemctl", &["is-active", "gazed"]),
-        Ok((true, ref state)) if state == "active"
-    );
+    let service_state = match command_output("systemctl", &["is-active", "gazed"]) {
+        Ok((_, state)) => state,
+        Err(_) => String::new(),
+    };
+    let daemon_starting = service_state == "active";
     let ready_wait = if daemon_starting {
         DAEMON_READY_TIMEOUT
     } else {
@@ -1737,15 +2022,12 @@ async fn check_daemon(
     };
 
     let proxy = match tokio::time::timeout(DAEMON_TIMEOUT, gaze_core::dbus::connect_gaze()).await {
-        Ok(Ok(proxy)) => {
-            report.pass("DBus", "com.gundulabs.Gaze is reachable on the system bus");
-            proxy
-        }
+        Ok(Ok(proxy)) => proxy,
         Ok(Err(err)) => {
             report.error(
                 "DBus",
-                format!("could not reach com.gundulabs.Gaze: {err}"),
-                "Run `systemctl status gazed` and `journalctl -u gazed -n 100 --no-pager`.",
+                format!("could not reach the system bus: {err}"),
+                "Run `systemctl status dbus` and confirm the system bus socket exists.",
             );
             check_cameras(report, config);
             return;
@@ -1753,13 +2035,56 @@ async fn check_daemon(
         Err(_) => {
             report.error(
                 "DBus",
-                "timed out waiting for com.gundulabs.Gaze",
-                "Run `systemctl status gazed` and inspect the daemon journal.",
+                "timed out connecting to the system bus",
+                "Run `systemctl status dbus` and confirm the system bus socket exists.",
             );
             check_cameras(report, config);
             return;
         }
     };
+
+    let name_wait_started = Instant::now();
+    let name_owned = gaze_name_has_owner(&proxy, ready_wait).await;
+    // gazed downloads models before it claims the name, so once it is on the bus the
+    // remaining budget is all the config call can need. Spend it once, not twice.
+    let ready_wait = ready_wait.saturating_sub(name_wait_started.elapsed());
+
+    if name_owned {
+        report.pass("DBus", "gazed owns com.gundulabs.Gaze on the system bus");
+    } else {
+        // Every later call would fail with the same "not activatable" error, so report the
+        // cause once instead of repeating it as a camera and an enrollment fault.
+        let (message, fix) = if !gaze_core::cpu::supports_inference() {
+            (
+                "gazed cannot run on this CPU (no AVX2), so it never reaches the system bus"
+                    .to_string(),
+                gaze_core::cpu::UNSUPPORTED_CPU_FIX.to_string(),
+            )
+        } else if daemon_starting {
+            (
+                "gazed is running but has not claimed com.gundulabs.Gaze yet (models may be downloading)"
+                    .to_string(),
+                "Wait for the first-run model download to finish, then re-run `gaze doctor`."
+                    .to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "gazed is not on the system bus (the service is {})",
+                    if service_state.is_empty() {
+                        "not reporting a state"
+                    } else {
+                        service_state.as_str()
+                    }
+                ),
+                "Run `sudo systemctl start gazed`, then `journalctl -u gazed -n 100 --no-pager` if it does not stay up."
+                    .to_string(),
+            )
+        };
+        report.error("DBus", message, fix);
+        check_cameras(report, config);
+        return;
+    }
 
     let mut daemon_config = None;
     match tokio::time::timeout(
@@ -1778,10 +2103,11 @@ async fn check_daemon(
             }
             daemon_config = Some(loaded_config);
         }
+        // The name was owned a moment ago, so losing it here means gazed exited mid-check.
         Ok(Err(err)) if dbus_is_not_activatable(&err) => report.error(
             "Daemon",
-            "gazed is still starting up (models may be downloading)",
-            "Wait for the first-run model download to finish, then re-run `gaze doctor`.",
+            "gazed left the system bus while doctor was querying it",
+            "Run `journalctl -u gazed -n 100 --no-pager` to see why it exited.",
         ),
         Ok(Err(err)) => report.error(
             "Daemon",
@@ -2269,6 +2595,15 @@ mod tests {
                 !profile_reads_system_db(broken, "gdm"),
                 "{broken:?} must not count as reading system-db:gdm"
             );
+        }
+    }
+
+    #[test]
+    fn dconf_booleans_are_read_strictly() {
+        assert_eq!(dconf_bool("true"), Some(true));
+        assert_eq!(dconf_bool("false"), Some(false));
+        for unset in ["", "@as []", "nothing to read", "True"] {
+            assert_eq!(dconf_bool(unset), None, "{unset:?} is not a boolean");
         }
     }
 
@@ -3012,5 +3347,70 @@ mod tests {
         ));
         assert!(!has_grosshack("# auth sufficient pam_gaze_grosshack.so"));
         assert!(!has_grosshack("auth sufficient pam_gaze.so simultaneous"));
+    }
+
+    #[test]
+    fn every_shipped_gdm_face_stack_passes_the_keyring_token() {
+        for template in ["gdm-face", "gdm-face.arch", "gdm-face.deb", "gdm-face.suse"] {
+            let path =
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../packaging/pam/").to_string() + template;
+            let contents = std::fs::read_to_string(&path).expect(template);
+            assert!(
+                gdm_face_stack_passes_the_token(&contents),
+                "{template} must hand the token to pam_gnome_keyring"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_or_misordered_keyring_stacks_are_not_reported_healthy() {
+        let valid = "auth [success=1 default=ignore] /usr/lib/security/pam_gaze.so\n\
+            auth requisite pam_deny.so\n\
+            auth optional pam_gnome_keyring.so use_authtok\n\
+            session optional pam_gnome_keyring.so auto_start\n";
+        assert!(gdm_face_stack_passes_the_token(valid));
+        for broken in [
+            valid.replace(
+                "auth [success=1 default=ignore] /usr/lib/security/pam_gaze.so\n",
+                "",
+            ),
+            valid.replace("[success=1 default=ignore]", "sufficient"),
+            valid.replace("pam_gaze.so", "pam_gaze.so simultaneous"),
+            valid.replace("requisite pam_deny.so", "optional pam_deny.so"),
+            valid.replace("auth requisite", "@include common-auth\nauth requisite"),
+            valid.replace("use_authtok", "not_use_authtok"),
+            valid.replace("use_authtok", "use_authtok only_if=login"),
+            valid.replace("session optional pam_gnome_keyring.so auto_start\n", ""),
+            valid.replace("session optional", "# session optional"),
+            valid.replace("auto_start", "auto_start only_if=login"),
+            format!(
+                "auth optional pam_gnome_keyring.so use_authtok\n{}",
+                valid.replace("auth optional pam_gnome_keyring.so use_authtok\n", "")
+            ),
+        ] {
+            assert!(!gdm_face_stack_passes_the_token(&broken), "{broken}");
+        }
+    }
+
+    #[test]
+    fn an_upgrade_preserved_gdm_face_stack_is_detected_as_stale() {
+        let stale = "auth required pam_env.so\n\
+             auth [success=done ignore=ignore default=bad] pam_gaze.so\n\
+             auth optional pam_gnome_keyring.so only_if=login auto_start\n\
+             auth required pam_deny.so\n";
+        assert!(!gdm_face_stack_passes_the_token(stale));
+
+        let no_keyring_module = "auth required pam_env.so\n\
+             auth [success=1 default=ignore] pam_gaze.so\n\
+             auth requisite pam_deny.so\n";
+        assert!(!gdm_face_stack_passes_the_token(no_keyring_module));
+
+        let commented_out = "auth [success=1 default=ignore] pam_gaze.so\n\
+             auth requisite pam_deny.so\n\
+             # auth optional pam_gnome_keyring.so use_authtok\n";
+        assert!(
+            !gdm_face_stack_passes_the_token(commented_out),
+            "a commented-out keyring line must not count"
+        );
     }
 }

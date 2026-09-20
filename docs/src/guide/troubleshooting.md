@@ -327,6 +327,34 @@ journalctl -u gazed -b
 
 Older Gaze builds could try to use the selected user's PipeWire runtime before that user session existed. Update Gaze if you see this behavior.
 
+#### GDM shows no face auth at all, and its journal says nothing
+
+Different from the SELinux case below: there the prompt appears and the camera
+stays dark, here nothing about face auth appears at the login screen and the
+greeter logs nothing, while the lock screen, `sudo` and `gaze auth` all work.
+
+The greeter has GNOME Shell's extension kill switch on, which stops every
+extension there regardless of what enables them:
+
+```bash
+sudo env DCONF_PROFILE=gdm XDG_CONFIG_HOME=/var/lib/gdm/seat0/config \
+  gsettings get org.gnome.shell disable-user-extensions
+```
+
+If that prints `true`, the value lives in GDM's own dconf database. That database
+is the one layer of the greeter profile that outranks the keyfiles Gaze installs
+under `/etc/dconf/db/gdm.d`, so adding an override there cannot help. Clear it at
+the source and reboot:
+
+```bash
+sudo rm -f /var/lib/gdm/seat0/config/dconf/user
+sudo reboot
+```
+
+GDM writes the file again with its own defaults. The path is under `/var/lib/gdm3`
+on Debian and Ubuntu, and a multi-seat machine has one directory per seat.
+`gaze doctor` reports this as **GDM login face auth** and names the exact file.
+
 #### GDM never scans on Fedora or SELinux-enabled systems
 
 If face auth works in your desktop session (`sudo`, the lock screen, `gaze auth`)
@@ -350,6 +378,26 @@ If the module is not listed, load it and reboot:
 sudo semodule -i /usr/share/gaze/gaze-gdm-camera.pp
 sudo reboot
 ```
+
+### Cinnamon
+
+Check that the extension is enabled from your Cinnamon session:
+
+```bash
+gsettings get org.cinnamon enabled-extensions | grep gaze@gundulabs.com
+```
+
+If it is missing, enable it from **System Settings → Extensions** or with the
+command in the [Cinnamon Extension guide](/guide/cinnamon#enable-the-extension),
+then reload Cinnamon (`Alt + F2`, `r`, Enter).
+
+On X11 sessions that use the standalone `cinnamon-screensaver` (Linux Mint 22.x
+and similar), the lock screen authenticates through
+`/etc/pam.d/cinnamon-screensaver` rather than the extension. Face unlock there
+needs `pam_gaze.so` in that service or in the shared auth stack, and it cannot
+show a confirmation button, so `require_confirmation_lock_screen = true` is not
+enforced on that surface. See
+[Lock screen behavior](/guide/cinnamon#lock-screen-behavior).
 
 ### KDE Plasma
 
@@ -477,9 +525,31 @@ your installed package predates the fix for Ubuntu 26.04's PAM module search pat
 curl -fsSL https://gaze.gundulabs.com/install.sh | sh
 ```
 
-## 10. Crash on launch (SIGSEGV) on older CPUs
+## 10. Crash on launch (SIGSEGV or SIGILL) on older CPUs
 
-On CPUs without AVX2 (roughly pre-2013), older builds of `gaze` and `gaze-gui` crashed immediately with a segmentation fault because the ONNX Runtime they statically linked requires AVX2. Current packages no longer link ONNX Runtime into the client binaries, so update to the latest packages if you see this. The `gazed` daemon itself still requires a CPU with AVX2.
+On CPUs without AVX2 (roughly pre-2013 Intel, pre-2015 AMD), older builds of `gaze` and `gaze-gui` crashed immediately with a segmentation fault because the ONNX Runtime they statically linked requires AVX2. Current packages no longer link ONNX Runtime into the client binaries, so update to the latest packages if you see this.
+
+The `gazed` daemon still requires a CPU with AVX2 and cannot be made to work without one. Confirm with:
+
+```bash
+grep -qw avx2 /proc/cpuinfo && echo "AVX2 present" || echo "AVX2 missing"
+```
+
+Current `gazed` builds detect this at startup and exit with status 78 before reaching ONNX Runtime, and the systemd unit sets `RestartPreventExitStatus=78`, so the service stops in a failed state instead of restarting forever. The journal shows one line:
+
+```
+gazed: AVX2 is unavailable; gazed cannot run on this CPU. Use a machine with AVX2 support. The CLI can run here, but the daemon cannot.
+```
+
+Older builds (0.3.2 and earlier) instead died with `status=4/ILL` on every start and crash-looped, because `Restart=on-failure` kept rescheduling them:
+
+```
+WARNING: This CPU does not support AVX2, which is required by ort's prebuilt ONNX Runtime binaries.
+gazed.service: Main process exited, code=dumped, status=4/ILL
+gazed.service: Scheduled restart job, restart counter is at 63.
+```
+
+If you are stuck on such a build, `sudo systemctl disable --now gazed` stops the loop.
 
 ## 11. Daemon dumps core with "Failed to initialize ORT API"
 

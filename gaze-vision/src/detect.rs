@@ -168,7 +168,7 @@ impl FaceDetector {
         }
 
         // SCRFD emits one tensor per stride per head, laid out as scores, then boxes, then
-        // optional keypoints, so head `i` for a stride lives at i, i+3 and i+6. Two anchors per cell.
+        // optional keypoints, so head `i` for a stride lives at i, i+3 and i+6. Two anchors a cell.
         let has_kps = num_outputs == 9;
         let strides = [8, 16, 32];
         let num_anchors = 2;
@@ -263,6 +263,8 @@ impl FaceDetector {
             return Err(DetectError::NoFacesDetected);
         }
 
+        // Keep boxes and landmarks in the padded image's coordinates: callers crop and align
+        // against the returned mat_rgb, so subtracting the padding here would misplace them.
         let scale_x = (mat_square.cols() as f32) / (w as f32);
         let scale_y = (mat_square.rows() as f32) / (h as f32);
 

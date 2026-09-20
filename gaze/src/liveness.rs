@@ -9,8 +9,8 @@ use ort::{session::Session, value::TensorRef};
 use gaze_core::config::InferenceConfig;
 use gaze_vision::inference::{InferenceRuntime, create_session};
 
-// Fixed by how MiniFASNet v2 was trained (upstream calls it scale_2.7_80x80). Feeding it a
-// tighter crop or another resolution shifts the score distribution and the threshold stops meaning anything.
+// Fixed by how MiniFASNet v2 was trained (upstream calls it scale_2.7_80x80). A tighter crop
+// or another resolution shifts the score distribution and the threshold stops meaning anything.
 const INPUT_SIZE: u32 = 80;
 const CROP_SCALE: f32 = 2.7;
 const SUSTAINED_SCORE_FRAMES: usize = 5;
@@ -74,7 +74,7 @@ impl LivenessDetector {
     }
 
     /// MiniFASNet emits three raw logits, not a probability, and the live class sits between the
-    /// two spoof classes. Softmax over all three, shifted by the max so the exponentials stay finite.
+    /// two spoof classes. Softmax over all three, shifted by the max to keep exponentials finite.
     fn live_score_from_output(data: &[f32]) -> anyhow::Result<f32> {
         if data.len() != 3 {
             anyhow::bail!("liveness model produced {} scores, expected 3", data.len());
@@ -110,6 +110,8 @@ pub fn crop_face(img: &RgbImage, bbox: [f32; 4]) -> anyhow::Result<RgbImage> {
     let mut right = center_x + scaled_w / 2.0;
     let mut bottom = center_y + scaled_h / 2.0;
 
+    // Shift the whole crop back into the image rather than clipping its edges: clipping would
+    // change the face-to-context ratio expected by the model. Bounds here are inclusive.
     if left < 0.0 {
         right -= left;
         left = 0.0;
@@ -152,6 +154,8 @@ pub struct EyeMotion {
 pub fn eye_motion_is_live(landmarks: &[[(f32, f32); 5]], min_ratio: Option<f32>) -> EyeMotion {
     let threshold = min_ratio.unwrap_or(MIN_EYE_MOTION_RATIO);
 
+    // With no usable frame pairs, `live` means "not proven static", not confirmed motion.
+    // Callers requiring positive evidence must also check `pairs` via motion_confirms_live.
     let neutral = EyeMotion {
         live: true,
         motion_ratio: 0.0,
@@ -164,6 +168,8 @@ pub fn eye_motion_is_live(landmarks: &[[(f32, f32); 5]], min_ratio: Option<f32>)
 
     let dist = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
 
+    // Divide displacement by eye separation to make it independent of face size. Keep the
+    // strongest pair so later still frames cannot erase motion already seen in this window.
     let (pairs, motion_ratio) = landmarks
         .windows(2)
         .filter_map(|pair| {
@@ -209,6 +215,8 @@ pub fn liveness_passes(scores: &[f32], threshold: f32) -> bool {
         return false;
     }
 
+    // If no single frame passes, allow the five strongest to average 85% of the threshold.
+    // These need not be consecutive; weaker frames do not dilute the accumulated evidence.
     finite_scores.sort_by(|a, b| b.total_cmp(a));
     let top_average = finite_scores
         .iter()
