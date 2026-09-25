@@ -559,6 +559,8 @@ pub struct StorageConfig {
     pub encrypt_templates: bool,
     #[serde(default = "default_false")]
     pub unlock_gnome_keyring: bool,
+    #[serde(default = "default_false")]
+    pub unlock_kwallet: bool,
 }
 
 impl Config {
@@ -566,6 +568,7 @@ impl Config {
     pub fn clamp_keyring(&mut self) -> bool {
         if self.storage.validate_keyring(&self.liveness).is_err() {
             self.storage.unlock_gnome_keyring = false;
+            self.storage.unlock_kwallet = false;
             return true;
         }
         false
@@ -574,10 +577,10 @@ impl Config {
 
 impl StorageConfig {
     pub fn validate_keyring(&self, liveness: &LivenessConfig) -> anyhow::Result<()> {
-        if self.unlock_gnome_keyring && (!self.encrypt_templates || !liveness.enabled) {
-            anyhow::bail!(
-                "storage.unlock_gnome_keyring requires storage.encrypt_templates and liveness.enabled"
-            );
+        if (self.unlock_gnome_keyring || self.unlock_kwallet)
+            && (!self.encrypt_templates || !liveness.enabled)
+        {
+            anyhow::bail!("keyring unlock requires storage.encrypt_templates and liveness.enabled");
         }
         Ok(())
     }
@@ -1079,19 +1082,23 @@ impl Config {
         Self::load_from(CONFIG_PATH)
     }
 
+    pub fn migrate_file(path: &str) {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Some(migrated) = migrate_legacy_config_contents(&contents) else {
+            return;
+        };
+        match replace_file_atomically(Path::new(path), &migrated) {
+            Ok(()) => tracing::info!("Migrated legacy configuration in {path}"),
+            Err(e) => tracing::warn!("Failed to write migrated config to {path}: {e}"),
+        }
+    }
+
     pub fn load_from(path: &str) -> anyhow::Result<Self> {
         if Path::new(path).exists() {
             let contents = std::fs::read_to_string(path)?;
-            let contents = if let Some(migrated) = migrate_legacy_config_contents(&contents) {
-                if let Err(e) = replace_file_atomically(Path::new(path), &migrated) {
-                    tracing::warn!("Failed to write migrated config to {path}: {e}");
-                } else {
-                    tracing::info!("Migrated legacy configuration in {path}");
-                }
-                migrated
-            } else {
-                contents
-            };
+            let contents = migrate_legacy_config_contents(&contents).unwrap_or(contents);
             let config: Config = toml_edit::de::from_str(&contents)?;
             for key in unknown_config_keys(&contents) {
                 tracing::warn!(
@@ -1647,16 +1654,15 @@ mod tests {
         // Case 1: default 40 frames migrates to 2.0s.
         let temp = TempDir::new("legacy-max-frames-40");
         let path = temp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[liveness]\nenabled = true\nthreshold = 0.85\nmax_frames = 40\n",
-        )
-        .unwrap();
+        let legacy = "[liveness]\nenabled = true\nthreshold = 0.85\nmax_frames = 40\n";
+        std::fs::write(&path, legacy).unwrap();
 
         let config = Config::load_from(path.to_str().unwrap()).unwrap();
         assert_eq!(config.liveness.max_seconds, 2.0);
         assert_eq!(config.liveness.threshold, 0.85);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
 
+        Config::migrate_file(path.to_str().unwrap());
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("max_seconds = 2.0"));
         assert!(!on_disk.contains("max_frames"));
@@ -1673,6 +1679,7 @@ mod tests {
         let config2 = Config::load_from(path2.to_str().unwrap()).unwrap();
         assert_eq!(config2.liveness.max_seconds, 0.83);
 
+        Config::migrate_file(path2.to_str().unwrap());
         let on_disk2 = std::fs::read_to_string(&path2).unwrap();
         assert!(on_disk2.contains("max_seconds = 0.83"));
         assert!(!on_disk2.contains("max_frames"));
@@ -2013,6 +2020,7 @@ mod tests {
             storage: StorageConfig {
                 encrypt_templates: true,
                 unlock_gnome_keyring: true,
+                unlock_kwallet: true,
             },
         };
 
@@ -2049,6 +2057,7 @@ mod tests {
         assert_eq!(loaded.liveness.max_seconds, 2.5);
         assert!(loaded.storage.encrypt_templates);
         assert!(loaded.storage.unlock_gnome_keyring);
+        assert!(loaded.storage.unlock_kwallet);
     }
 
     #[test]
@@ -2415,6 +2424,25 @@ level = "low""#,
         )
         .unwrap();
         assert!(!absent.storage.encrypt_templates);
+    }
+
+    #[test]
+    fn kwallet_is_independent_and_clamped_without_prerequisites() {
+        let mut config = Config::default();
+        assert!(!config.storage.unlock_kwallet);
+        assert!(unknown_config_keys("[storage]\nunlock_kwallet = true").is_empty());
+        for (encrypted, live) in [(false, true), (true, false), (false, false), (true, true)] {
+            config.storage.unlock_kwallet = true;
+            config.storage.encrypt_templates = encrypted;
+            config.liveness.enabled = live;
+            assert_eq!(
+                config.storage.validate_keyring(&config.liveness).is_ok(),
+                encrypted && live
+            );
+            assert_eq!(config.clamp_keyring(), !(encrypted && live));
+            assert_eq!(config.storage.unlock_kwallet, encrypted && live);
+            assert!(!config.storage.unlock_gnome_keyring);
+        }
     }
 
     #[test]

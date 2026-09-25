@@ -36,6 +36,7 @@ const PLASMALOGIN_FACE_PAM_FILE: &str = "/etc/pam.d/plasmalogin-fingerprint";
 const VENDOR_PAM_DIR: &str = "/usr/lib/pam.d";
 const POLKIT_PAM_FILE: &str = "/etc/pam.d/polkit-1";
 const ELEVATION_PAM_SERVICE: &str = "sudo";
+const PAM_SUDO_OPTOUT_PATH: &str = "/etc/gaze/pam-sudo.optout";
 
 fn read_pam_service(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().or_else(|| {
@@ -185,8 +186,16 @@ pub async fn run(username: &str, benchmark: bool) -> anyhow::Result<bool> {
     check_pam(&mut report);
     check_privileged_files(&mut report);
     check_desktop_integration(&mut report);
+    check_kde_confirmation_bypass(
+        &mut report,
+        config.as_ref(),
+        read_pam_service(KDE_FACE_PAM_FILE).as_deref(),
+        read_pam_service(KDE_SMARTCARD_PAM_FILE).as_deref(),
+        read_pam_service(PLASMALOGIN_FACE_PAM_FILE).as_deref(),
+    );
     check_tpm(&mut report, config.as_ref());
     check_keyring(&mut report, username, config.as_ref());
+    check_kwallet(&mut report, username, config.as_ref());
     check_daemon(&mut report, username, config.as_ref(), benchmark).await;
 
     report.print()?;
@@ -482,10 +491,15 @@ fn semodule_lists(output: &str, module: &str) -> bool {
 enum GdmCameraPolicy {
     Loaded,
     NotLoaded,
+    NeedsRoot,
     Unverifiable(String),
 }
 
 fn gdm_camera_policy() -> GdmCameraPolicy {
+    if !running_as_root() {
+        return GdmCameraPolicy::NeedsRoot;
+    }
+
     match command_output("semodule", &["-l"]) {
         Ok((true, output)) if semodule_lists(&output, GDM_SELINUX_MODULE) => {
             GdmCameraPolicy::Loaded
@@ -511,7 +525,11 @@ fn check_gdm_selinux(report: &mut Report) {
         return;
     }
 
-    match gdm_camera_policy() {
+    report_gdm_camera_policy(report, gdm_camera_policy());
+}
+
+fn report_gdm_camera_policy(report: &mut Report, policy: GdmCameraPolicy) {
+    match policy {
         GdmCameraPolicy::Loaded => report.pass(
             "GDM camera SELinux policy",
             format!("{GDM_SELINUX_MODULE} is loaded, so the greeter can open the camera"),
@@ -523,11 +541,19 @@ fn check_gdm_selinux(report: &mut Report) {
             ),
             gdm_selinux_fix(),
         ),
+        GdmCameraPolicy::NeedsRoot => report.warning(
+            "GDM camera SELinux policy",
+            format!(
+                "SELinux is enforcing, and whether {GDM_SELINUX_MODULE} is loaded could not be \
+                 checked without root"
+            ),
+            "Run `sudo gaze doctor` to read the loaded module list.",
+        ),
         GdmCameraPolicy::Unverifiable(why) => report.warning(
             "GDM camera SELinux policy",
             format!("SELinux is enforcing, but the loaded module list could not be read: {why}"),
             format!(
-                "Run `sudo semodule -l | grep {GDM_SELINUX_MODULE}`; if it prints nothing, {}",
+                "Run `semodule -l | grep {GDM_SELINUX_MODULE}`; if it prints nothing, {}",
                 gdm_selinux_fix()
             ),
         ),
@@ -1227,6 +1253,17 @@ fn check_elevation_pam(report: &mut Report) {
             "Elevation PAM",
             format!("the {ELEVATION_PAM_SERVICE} service reaches a Gaze module"),
         );
+    } else if Path::new(PAM_SUDO_OPTOUT_PATH).exists() {
+        report.off(
+            "Elevation PAM",
+            format!(
+                "face authentication for {ELEVATION_PAM_SERVICE} is opted out, so terminal elevation always asks for a password"
+            ),
+            format!(
+                "Turn it back on: `sudo rm {PAM_SUDO_OPTOUT_PATH}`. {}",
+                shared_stack_hint()
+            ),
+        );
     } else {
         report.warning(
             "Elevation PAM",
@@ -1269,6 +1306,10 @@ fn desktop_name() -> String {
     // `sudo` strips those, so fall back to what is running: otherwise
     // `sudo gaze doctor` silently drops every desktop check.
     desktop_from_processes(owning_uid())
+}
+
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// The user whose session is being checked: the invoking user under `sudo`.
@@ -1626,6 +1667,49 @@ fn check_kde_login_greeter(report: &mut Report, plasmalogin_face: Option<&str>) 
     }
 }
 
+/// The KDE biometric slots start without anything to route a response back, so
+/// `require_confirmation_lock_screen` is silently ignored there by design:
+/// prompting would hang the slot for the rest of the lock rather than ask
+/// anybody anything. Say so when the toggle is on and a slot is wired, instead
+/// of letting the setting imply a confirmation that never happens.
+fn check_kde_confirmation_bypass(
+    report: &mut Report,
+    config: Option<&Config>,
+    kde_fingerprint: Option<&str>,
+    kde_smartcard: Option<&str>,
+    plasmalogin_face: Option<&str>,
+) {
+    const NAME: &str = "KDE confirmation";
+    let Some(config) = config else {
+        return;
+    };
+    if !config.auth.require_confirmation_lock_screen {
+        return;
+    }
+    let mut bypassed = Vec::new();
+    if slot_status(kde_fingerprint) == KdeLockStatus::Wired {
+        bypassed.push(KDE_FACE_PAM_FILE.trim_start_matches("/etc/pam.d/"));
+    }
+    if slot_status(kde_smartcard) == KdeLockStatus::Wired {
+        bypassed.push(KDE_SMARTCARD_PAM_FILE.trim_start_matches("/etc/pam.d/"));
+    }
+    if plasmalogin_face.is_some_and(|contents| slot_status(Some(contents)) == KdeLockStatus::Wired)
+    {
+        bypassed.push(PLASMALOGIN_FACE_PAM_FILE.trim_start_matches("/etc/pam.d/"));
+    }
+    if bypassed.is_empty() {
+        return;
+    }
+    report.warning(
+        NAME,
+        format!(
+            "require_confirmation_lock_screen is on, but {} cannot be prompted, so a face match unlocks without confirmation there",
+            bypassed.join(", ")
+        ),
+        "This is by design: the greeter never delivers a response to a noninteractive slot, so asking would hang it for the rest of the lock. Leave the toggle for surfaces that can prompt (sudo with a TTY, polkit, GNOME), or turn it off if the KDE bypass surprises you. See the KDE guide.",
+    );
+}
+
 fn hyprlock_selects_gaze(contents: &str) -> bool {
     contents.lines().any(|line| {
         let line = line.split('#').next().unwrap_or_default();
@@ -1763,13 +1847,13 @@ fn gdm_face_stack_passes_the_token(contents: &str) -> bool {
     handoff && session
 }
 
-fn keyring_record_state(username: &str) -> Option<bool> {
-    if unsafe { libc::geteuid() } != 0 {
+fn keyring_record_state(username: &str, backend: gaze_security::keyring::Backend) -> Option<bool> {
+    if !running_as_root() {
         return None;
     }
     let uid = user_uid(username)?;
     Some(
-        Path::new(gaze_security::keyring::STORE_DIR)
+        Path::new(backend.store_dir())
             .join(format!("{uid}.keyring"))
             .exists(),
     )
@@ -1833,7 +1917,15 @@ fn check_keyring(report: &mut Report, username: &str, config: Option<&Config>) {
         Some(_) => {}
     }
 
-    match keyring_record_state(username) {
+    report_keyring_record(
+        report,
+        username,
+        keyring_record_state(username, gaze_security::keyring::Backend::Gnome),
+    );
+}
+
+fn report_keyring_record(report: &mut Report, username: &str, state: Option<bool>) {
+    match state {
         Some(true) => report.pass(
             "Keyring",
             format!("a TPM-protected keyring credential is enrolled for {username}"),
@@ -1843,12 +1935,109 @@ fn check_keyring(report: &mut Report, username: &str, config: Option<&Config>) {
             format!("GNOME Keyring unlock is enabled but {username} has no enrolled credential"),
             format!("Run `sudo gaze keyring --user {username}`."),
         ),
-        None => report.pass(
+        None => report.warning(
             "Keyring",
             format!(
-                "the {GDM_FACE_PAM_SERVICE} stack passes the token; run `sudo gaze doctor` to \
-                 also check whether {username} is enrolled"
+                "the {GDM_FACE_PAM_SERVICE} stack passes the token, but whether {username} has \
+                 an enrolled credential could not be checked without root"
             ),
+            "Run `sudo gaze doctor` to check the credential record.",
+        ),
+    }
+}
+
+/// Check the exact managed branch: no wallet hook is reachable on biometric failure.
+fn kde_login_stack_passes_the_token(contents: &str) -> bool {
+    let entries: Vec<_> = contents.lines().filter_map(pam_entry).collect();
+    let auth: Vec<_> = entries.iter().filter(|entry| entry.0 == "auth").collect();
+    let handoff = auth.windows(4).any(|lines| {
+        let (_, control, module, options) = *lines[0];
+        module == "pam_gaze.so"
+            && (control
+                .split_ascii_whitespace()
+                .eq(["[success=1", "default=ignore]"])
+                || control
+                    .split_ascii_whitespace()
+                    .eq(["[success=1", "default=die]"]))
+            && options.split_ascii_whitespace().eq(["kde-login"])
+            && lines[1]
+                .1
+                .split_ascii_whitespace()
+                .eq(["[success=2", "default=ignore]"])
+            && lines[1].2 == "pam_permit.so"
+            && lines[2].1 == "optional"
+            && lines[2].2 == "pam_kwallet5.so"
+            && lines[2].3.is_empty()
+            && lines[3]
+                .1
+                .split_ascii_whitespace()
+                .eq(["[success=done", "default=ignore]"])
+            && lines[3].2 == "pam_permit.so"
+    });
+    handoff
+        && entries.iter().any(|&(kind, control, module, options)| {
+            kind == "session"
+                && control == "optional"
+                && module == "pam_kwallet5.so"
+                && options.split_ascii_whitespace().eq(["auto_start"])
+        })
+}
+
+fn check_kwallet(report: &mut Report, username: &str, config: Option<&Config>) {
+    let Some(config) = config else { return };
+    if !config.storage.unlock_kwallet {
+        report.off("KWallet", "KWallet unlock after a KDE face login is off",
+            "Enable KWallet unlock in `gaze config`, then run `gaze keyring --kwallet` and `sudo gaze-kde-pam enable-login`.");
+        return;
+    }
+    if let Err(err) = config.storage.validate_keyring(&config.liveness) {
+        report.error("KWallet", format!("KWallet unlock is enabled but unusable: {err}"),
+            "Enable TPM template encryption and liveness, or disable KWallet unlock in `gaze config`.");
+        return;
+    }
+    if !pam_search_dirs()
+        .iter()
+        .any(|dir| dir.join("pam_kwallet5.so").exists())
+    {
+        report.warning(
+            "KWallet",
+            "pam_kwallet5.so was not found",
+            "Install your distribution's KWallet PAM package (kwallet-pam or libpam-kwallet5).",
+        );
+    }
+    let mut found = false;
+    for service in ["sddm", "plasmalogin", "plasmalogin-fingerprint"] {
+        let Some(contents) = read_pam_service(&format!("/etc/pam.d/{service}")) else {
+            continue;
+        };
+        found = true;
+        if !kde_login_stack_passes_the_token(&contents) {
+            report.warning("KWallet", format!("{service} lacks the managed KWallet handoff/session hook"),
+                "Run `sudo gaze-kde-pam enable-login`. Custom PAM entries must use sequential mode and pass the token to pam_kwallet5 before ending authentication.");
+        }
+    }
+    if !found {
+        report.error(
+            "KWallet",
+            "No supported KDE login PAM service was found",
+            "Install SDDM or Plasma Login Manager and run `sudo gaze-kde-pam enable-login`.",
+        );
+        return;
+    }
+    match keyring_record_state(username, gaze_security::keyring::Backend::KWallet) {
+        Some(true) => report.pass(
+            "KWallet",
+            format!("a TPM-protected KWallet credential is enrolled for {username}"),
+        ),
+        Some(false) => report.warning(
+            "KWallet",
+            format!("{username} has no enrolled KWallet credential"),
+            format!("Run `sudo gaze keyring --kwallet --user {username}`."),
+        ),
+        None => report.warning(
+            "KWallet",
+            "KWallet enrollment could not be checked without root",
+            "Run `sudo gaze doctor` to check the credential record.",
         ),
     }
 }
@@ -2703,6 +2892,84 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_module_store_is_never_reported_as_a_missing_policy() {
+        let reported = |policy| {
+            let mut report = Report::default();
+            report_gdm_camera_policy(&mut report, policy);
+            let check = report
+                .checks
+                .into_iter()
+                .find(|check| check.name == "GDM camera SELinux policy")
+                .expect("the SELinux check always reports once it runs");
+            (check.level, check.message, check.fix.unwrap_or_default())
+        };
+
+        let (level, _, _) = reported(GdmCameraPolicy::Loaded);
+        assert_eq!(level, Level::Pass);
+
+        let (level, _, _) = reported(GdmCameraPolicy::NotLoaded);
+        assert_eq!(
+            level,
+            Level::Error,
+            "a module store we read and found empty is a real failure"
+        );
+
+        let (level, message, fix) = reported(GdmCameraPolicy::NeedsRoot);
+        assert_eq!(level, Level::Warning);
+        assert!(
+            message.contains("without root"),
+            "an unprivileged run must say what it could not see: {message}"
+        );
+        assert!(
+            !message.contains("is not loaded"),
+            "an unchecked module must not be reported as absent: {message}"
+        );
+        assert!(
+            fix.contains("sudo gaze doctor"),
+            "the fix is to re-run as root, not to load the module: {fix}"
+        );
+        assert!(
+            !fix.contains("semodule -i"),
+            "loading a module that may already be there is not the remedy: {fix}"
+        );
+
+        let (level, _, _) = reported(GdmCameraPolicy::Unverifiable("broken".into()));
+        assert_eq!(level, Level::Warning);
+    }
+
+    #[test]
+    fn keyring_enrollment_that_could_not_be_read_is_not_a_checkmark() {
+        let reported = |state| {
+            let mut report = Report::default();
+            report_keyring_record(&mut report, "lambros", state);
+            let check = report
+                .checks
+                .into_iter()
+                .find(|check| check.name == "Keyring")
+                .expect("the keyring record always reports");
+            (check.level, check.message, check.fix.unwrap_or_default())
+        };
+
+        let (level, _, _) = reported(Some(true));
+        assert_eq!(level, Level::Pass);
+
+        let (level, _, _) = reported(Some(false));
+        assert_eq!(level, Level::Warning);
+
+        let (level, message, fix) = reported(None);
+        assert_eq!(
+            level,
+            Level::Warning,
+            "an unprivileged run never checked the record, so it cannot pass it"
+        );
+        assert!(
+            message.contains("without root"),
+            "say which half of the check ran: {message}"
+        );
+        assert!(fix.contains("sudo gaze doctor"), "{fix}");
+    }
+
+    #[test]
     fn hyprlock_modern_pam_module_key_is_detected() {
         let contents = "auth {\n    pam {\n        module = hyprlock-gaze\n    }\n}\n";
         assert!(hyprlock_selects_gaze(contents));
@@ -2917,6 +3184,49 @@ mod tests {
             Level::Warning
         );
         assert_eq!(level(None, None), Level::Warning);
+    }
+
+    #[test]
+    fn kde_confirmation_bypass_is_reported_when_the_toggle_is_on_and_a_slot_is_wired() {
+        let check = |confirmation: bool,
+                     fingerprint: Option<&str>,
+                     smartcard: Option<&str>,
+                     face: Option<&str>| {
+            let mut config = Config::default();
+            config.auth.require_confirmation_lock_screen = confirmation;
+            let mut report = Report::default();
+            check_kde_confirmation_bypass(&mut report, Some(&config), fingerprint, smartcard, face);
+            report
+                .checks
+                .iter()
+                .find(|check| check.name == "KDE confirmation")
+                .map(|check| (check.level, check.message.clone()))
+        };
+
+        // Off means nothing to say, even when a slot is wired.
+        assert!(check(false, Some("auth sufficient pam_gaze.so"), None, None).is_none());
+        // On with nothing wired means nothing is bypassed.
+        assert!(check(true, None, None, None).is_none());
+        assert!(check(true, Some("auth required pam_fprintd.so"), None, None).is_none());
+
+        let (level, message) = check(true, Some("auth sufficient pam_gaze.so"), None, None)
+            .expect("a wired slot with confirmation on must warn");
+        assert_eq!(level, Level::Warning);
+        assert!(message.contains("kde-fingerprint"), "{message}");
+        assert!(
+            message.contains("require_confirmation_lock_screen"),
+            "{message}"
+        );
+
+        let (_, message) = check(
+            true,
+            None,
+            Some("auth sufficient pam_gaze.so"),
+            Some("auth sufficient pam_gaze.so"),
+        )
+        .expect("both smartcard and greeter slots must warn");
+        assert!(message.contains("kde-smartcard"), "{message}");
+        assert!(message.contains("plasmalogin-fingerprint"), "{message}");
     }
 
     #[test]
@@ -3347,6 +3657,30 @@ mod tests {
         ));
         assert!(!has_grosshack("# auth sufficient pam_gaze_grosshack.so"));
         assert!(!has_grosshack("auth sufficient pam_gaze.so simultaneous"));
+    }
+
+    #[test]
+    fn kwallet_diagnostics_reject_bypassed_or_unsafe_handoffs() {
+        let valid = "-auth [success=1 default=ignore] pam_gaze.so kde-login\n\
+            -auth [success=2 default=ignore] pam_permit.so\n\
+            -auth optional pam_kwallet5.so\n\
+            -auth [success=done default=ignore] pam_permit.so\n\
+            -session optional pam_kwallet5.so auto_start\n";
+        assert!(kde_login_stack_passes_the_token(valid));
+        assert!(kde_login_stack_passes_the_token(&valid.replacen(
+            "default=ignore",
+            "default=die",
+            1
+        )));
+        for invalid in [
+            valid.replace("success=1", "success=done"),
+            valid.replace("success=2", "success=1"),
+            valid.replace("kde-login", "simultaneous"),
+            valid.replace("-auth optional pam_kwallet5.so\n", ""),
+            valid.replace("-session optional pam_kwallet5.so auto_start\n", ""),
+        ] {
+            assert!(!kde_login_stack_passes_the_token(&invalid));
+        }
     }
 
     #[test]

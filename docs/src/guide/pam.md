@@ -284,19 +284,25 @@ follow [Other distros (manual)](#other-distros-manual) and add
 
 ## Arch Linux / Manjaro
 
-The one-liner installer and the AUR package post-install script both configure `/etc/pam.d/sudo` automatically, inserting `pam_gaze.so` before the existing `auth include system-auth` line.
+The one-liner installer and the AUR package post-install script both configure `/etc/pam.d/sudo` automatically, inserting a faillock preauth gate and `pam_gaze.so` before the existing `auth include system-auth` line. The gate runs first so a locked-out account is rejected before face authentication can succeed; they do this only once: if you take the lines out again, upgrades leave them out. See [Opting out of the sudo change](#opting-out-of-the-sudo-change).
 
 If you need to apply or re-apply it manually:
 
 ```bash
 sudo awk '
     /^[[:space:]]*auth[[:space:]]/ && !done {
+        print "-auth       requisite     pam_faillock.so preauth"
         print "auth        sufficient    pam_gaze.so"
         done = 1
     }
     { print }
 ' /etc/pam.d/sudo | sudo tee /tmp/pam-sudo-new && sudo install -m 644 /tmp/pam-sudo-new /etc/pam.d/sudo
 ```
+
+A successful face authentication skips the rest of the stack, so the preauth
+gate must come first: without it a locked-out account could still pass face
+authentication. If the file's first `auth` line is already a faillock preauth,
+add only the `pam_gaze.so` line below it.
 
 Then test:
 
@@ -308,12 +314,40 @@ sudo -v
 `/etc/pam.d/system-auth` is owned by the `pambase` package and gets overwritten on system upgrades. Gaze is added to `/etc/pam.d/sudo` directly to avoid this, but if you manually added `pam_gaze.so` to `system-auth` it will be lost on `pambase` updates.
 :::
 
+### Opting out of the sudo change
+
+`/etc/pam.d/sudo` belongs to the `sudo` package, not to Gaze. Once Gaze inserts its line pacman sees the file as locally modified and writes `/etc/pam.d/sudo.pacnew` on later `sudo` updates instead of replacing it, so those updates have to be merged by hand.
+
+To keep face authentication out of terminal elevation, delete the `pam_gaze.so` line and the faillock gate above it:
+
+```bash
+sudo sed -i '/pam_gaze/d; /^-auth       requisite     pam_faillock\.so preauth$/d' /etc/pam.d/sudo
+```
+
+Gaze will not add it back. The next install or upgrade notices the line it wrote is gone, records the choice in `/etc/gaze/pam-sudo.optout`, and leaves the file alone from then on. Once that marker exists `gaze doctor` reports the sudo slot as off instead of warning about it.
+
+To skip the wait, or to keep Gaze away from `/etc/pam.d/sudo` from the very first install, write the marker yourself:
+
+```bash
+sudo mkdir -p /etc/gaze
+sudo touch /etc/gaze/pam-sudo.optout
+```
+
+To undo the opt-out, remove the marker and re-apply the line by hand with the `awk` command above:
+
+```bash
+sudo rm /etc/gaze/pam-sudo.optout
+```
+
+Removing the Gaze package deletes the marker along with the rest of `/etc/gaze`.
+
 ### Polkit (graphical "Authentication Required" prompts)
 
 Arch's `polkit` package ships no `/etc/pam.d/polkit-1`, so the `polkit-1` PAM service falls back to the vendor default at `/usr/lib/pam.d/polkit-1`, which just does `include system-auth`. Since Gaze avoids patching `system-auth` (see above), graphical polkit prompts (`pkexec`, GNOME Settings, package manager GUIs, etc.) don't get face auth unless a `/etc/pam.d/polkit-1` override is installed too. The Arch package and `dev-link-system.sh` create one automatically, and only on Arch:
 
 ```text
 #%PAM-1.0
+-auth       requisite     pam_faillock.so preauth
 auth       sufficient   pam_gaze.so
 auth       include      system-auth
 account    include      system-auth

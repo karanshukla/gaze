@@ -13,6 +13,7 @@ CINNAMON_DOCS_URL="https://gaze.gundulabs.com/guide/cinnamon"
 HYPRLAND_DOCS_URL="https://gaze.gundulabs.com/guide/hyprland"
 KDE_DOCS_URL="https://gaze.gundulabs.com/guide/kde"
 PAM_DOCS_URL="https://gaze.gundulabs.com/guide/pam"
+PAM_SUDO_OPTOUT="/etc/gaze/pam-sudo.optout"
 REPO_KEY_FPR="505AC1C71AFEDBD5555235F6CB4FA24E5C1C7C98"
 AUTO_YES=0
 
@@ -515,13 +516,38 @@ configure_pam_arch() {
         return 0
     fi
 
+    if sudo test -e "$PAM_SUDO_OPTOUT"; then
+        say "Leaving $pam_file alone ($PAM_SUDO_OPTOUT exists)."
+        return 0
+    fi
+
     if grep -q "pam_gaze" "$pam_file" 2>/dev/null; then
         ok "Gaze already configured in $pam_file."
         return 0
     fi
 
-    awk '
-        /^[[:space:]]*auth[[:space:]]/ && !done {
+    if sudo grep -qxF "$pam_file" /etc/gaze/pam-arch.configured 2>/dev/null; then
+        say "Gaze was removed from $pam_file by hand; leaving it that way."
+        say "Delete $PAM_SUDO_OPTOUT and re-run to undo."
+        record_pam_sudo_optout
+        return 0
+    fi
+
+    first_auth=$(grep -m1 -E '^[[:space:]]*-?auth[[:space:]]' "$pam_file" 2>/dev/null || true)
+    case "$first_auth" in
+        *pam_faillock.so*preauth*) gate=after ;;
+        *) gate=before ;;
+    esac
+
+    awk -v gate="$gate" '
+        /^[[:space:]]*-?auth[[:space:]]/ && !done {
+            if (gate == "after") {
+                print
+                print "auth        sufficient    pam_gaze.so"
+                done = 1
+                next
+            }
+            print "-auth       requisite     pam_faillock.so preauth"
             print "auth        sufficient    pam_gaze.so"
             done = 1
         }
@@ -529,14 +555,29 @@ configure_pam_arch() {
     ' "$pam_file" >"$TMP/pam-sudo" &&
         sudo install -m 644 "$TMP/pam-sudo" "$pam_file" && {
         ok "Configured $pam_file to use Gaze face authentication."
+        say "$pam_file belongs to the sudo package, so pacman will report it as"
+        say "modified and write .pacnew files on later sudo updates."
+        say "Delete the pam_gaze.so and faillock gate lines to opt out; Gaze will not put them back."
         sudo mkdir -p /etc/gaze
-        printf '%s\n' "$pam_file" | sudo tee /etc/gaze/pam-arch.configured >/dev/null
+        sudo grep -qxF "$pam_file" /etc/gaze/pam-arch.configured 2>/dev/null ||
+            printf '%s\n' "$pam_file" | sudo tee -a /etc/gaze/pam-arch.configured >/dev/null
     } || {
         warn "Could not configure PAM for sudo automatically."
-        say "To enable Gaze for sudo, add before the auth line in $pam_file:"
+        say "To enable Gaze for sudo, add before the first auth line in $pam_file:"
+        cmd "-auth requisite pam_faillock.so preauth"
         cmd "auth    sufficient    pam_gaze.so"
         link "$PAM_DOCS_URL"
     }
+}
+
+record_pam_sudo_optout() {
+    sudo test -e "$PAM_SUDO_OPTOUT" && return 0
+    sudo mkdir -p /etc/gaze
+    printf '%s\n%s\n' \
+        "# Gaze leaves /etc/pam.d/sudo alone while this file exists." \
+        "# Delete it to let the next install or upgrade add pam_gaze.so back." |
+        sudo tee "$PAM_SUDO_OPTOUT" >/dev/null
+    sudo chmod 644 "$PAM_SUDO_OPTOUT" || true
 }
 
 configure_authselect() {

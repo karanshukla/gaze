@@ -297,6 +297,14 @@ pam_stack_has_gaze() {
     return 1
 }
 
+first_auth_is_faillock_preauth() {
+    first_auth=$(grep -m1 -E '^[[:space:]]*-?auth[[:space:]]' "$1" 2>/dev/null || true)
+    case "$first_auth" in
+        *pam_faillock.so*preauth*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 insert_pam_gaze() {
     pam_file=$1
     if pam_stack_has_gaze "$pam_file"; then
@@ -306,13 +314,26 @@ insert_pam_gaze() {
     fi
 
     tmp=$(mktemp)
-    awk '
-        /^[[:space:]]*auth[[:space:]]/ && !done {
-            print "auth        sufficient    pam_gaze.so"
-            done = 1
-        }
-        { print }
-    ' "$pam_file" > "$tmp" && install -m 644 "$tmp" "$pam_file"
+    if first_auth_is_faillock_preauth "$pam_file"; then
+        awk '
+            /^[[:space:]]*-?auth[[:space:]]/ && !done {
+                print
+                print "auth        sufficient    pam_gaze.so"
+                done = 1
+                next
+            }
+            { print }
+        ' "$pam_file" > "$tmp" && install -m 644 "$tmp" "$pam_file"
+    else
+        awk '
+            /^[[:space:]]*-?auth[[:space:]]/ && !done {
+                print "-auth       requisite     pam_faillock.so preauth"
+                print "auth        sufficient    pam_gaze.so"
+                done = 1
+            }
+            { print }
+        ' "$pam_file" > "$tmp" && install -m 644 "$tmp" "$pam_file"
+    fi
     rm -f "$tmp"
 
     if grep -q "pam_gaze" "$pam_file" 2>/dev/null; then
@@ -336,7 +357,7 @@ restore_pam_config() {
 
     while IFS= read -r pam_file; do
         [ -f "$pam_file" ] || continue
-        sed -i '/pam_gaze/d' "$pam_file" && printf 'restored PAM: %s\n' "$pam_file"
+        sed -i '/pam_gaze/d; /^-auth       requisite     pam_faillock\.so preauth$/d' "$pam_file" && printf 'restored PAM: %s\n' "$pam_file"
     done < "$flag"
 
     rm -f "$flag"
@@ -368,6 +389,7 @@ link_polkit_pam_config() {
 
     cat > "$pam_file" <<-EOF
 	#%PAM-1.0
+	-auth       requisite     pam_faillock.so preauth
 	auth       sufficient   pam_gaze.so
 	auth       include      system-auth
 	account    include      system-auth

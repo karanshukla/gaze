@@ -55,6 +55,11 @@ abort_if_lid_closed = true
 # session keyring on GNOME; every unlock after a suspend uses your face. Reset whenever
 # gazed restarts.
 abort_before_first_resume = false
+# Ask for an explicit confirmation after a face match on lock/login screens.
+# Note: the KDE biometric slots (kde-fingerprint, kde-smartcard,
+# plasmalogin-fingerprint) cannot be prompted — nothing routes a response back —
+# so the toggle is silently ignored there by design (asking would hang the slot
+# for the rest of the lock). See `gaze doctor` and the KDE guide.
 require_confirmation_lock_screen = false
 require_confirmation_elevation = false
 # Delay face auth by this many milliseconds on the first unlock after resuming from
@@ -98,3 +103,7 @@ encrypt_templates = false
 # Opt-in GNOME Keyring unlock on gdm-face. Requires TPM encryption and liveness.
 # Enroll each user's keyring password with `gaze keyring`; no secrets go in this file.
 unlock_gnome_keyring = false
+# Opt-in KDE KWallet unlock on SDDM / Plasma Login Manager (sequential PAM only).
+# Same TPM/liveness requirements. Run `gaze keyring --kwallet` and
+# `sudo gaze-kde-pam enable-login`; install your distro's KWallet PAM package.
+unlock_kwallet = false

@@ -23,6 +23,7 @@ pub enum PamMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PamOptions {
     pub mode: PamMode,
+    pub kde_login: bool,
 }
 
 pub fn parse_pam_options<'a, I>(args: I) -> PamOptions
@@ -34,6 +35,7 @@ where
         match arg {
             "simultaneous" => options.mode = PamMode::Simultaneous,
             "retry" => options.mode = PamMode::Retry,
+            "kde-login" => options.kde_login = true,
             _ => {}
         }
     }
@@ -60,6 +62,7 @@ pub unsafe fn parse_raw_pam_options(argc: c_int, argv: *const *const c_char) -> 
         match unsafe { CStr::from_ptr(arg_ptr) }.to_str() {
             Ok("simultaneous") => options.mode = PamMode::Simultaneous,
             Ok("retry") => options.mode = PamMode::Retry,
+            Ok("kde-login") => options.kde_login = true,
             _ => {}
         }
     }
@@ -224,8 +227,7 @@ unsafe fn do_authenticate_sequential(pamh: PamHandle, flags: c_int, options: Pam
             unsafe { report_outcome(pamh, service.as_deref(), silent, text, is_internal) };
         };
 
-        let require_keyring =
-            service.as_deref() == Some(FACE_PAM_SERVICE) && config.storage.unlock_gnome_keyring;
+        let require_keyring = keyring_backend(service.as_deref(), &config).is_some();
         let verdict = verify_within(
             &proxy,
             &username,
@@ -298,7 +300,13 @@ unsafe fn do_authenticate_sequential(pamh: PamHandle, flags: c_int, options: Pam
         authenticated,
         service.as_deref(),
         &loaded_config,
-        || unsafe { supply_keyring_token(pamh, &username) },
+        || unsafe {
+            supply_keyring_token(
+                pamh,
+                &username,
+                keyring_backend(service.as_deref(), &loaded_config).unwrap(),
+            )
+        },
     );
     if authenticated == PAM_SUCCESS && result == PAM_AUTHINFO_UNAVAIL {
         unsafe {
@@ -311,7 +319,41 @@ unsafe fn do_authenticate_sequential(pamh: PamHandle, flags: c_int, options: Pam
             )
         };
     }
+    // pam_kwallet5 prompts when PAM_AUTHTOK is null, but ignores an empty token.
+    // Successful unenrolled/opted-out face logins must not create a second greeter prompt.
+    if result == PAM_SUCCESS && is_kwallet_login(service.as_deref()) {
+        let mut existing = std::ptr::null();
+        if unsafe { pam_get_item(pamh, PAM_AUTHTOK, &mut existing) } != PAM_SUCCESS {
+            return PAM_AUTHINFO_UNAVAIL;
+        }
+        if existing.is_null()
+            && unsafe { pam_set_item(pamh, PAM_AUTHTOK, c"".as_ptr().cast()) } != PAM_SUCCESS
+        {
+            return PAM_AUTHINFO_UNAVAIL;
+        }
+    }
     result
+}
+
+fn is_kwallet_login(service: Option<&str>) -> bool {
+    matches!(
+        service,
+        Some("sddm" | "plasmalogin" | "plasmalogin-fingerprint")
+    )
+}
+
+fn keyring_backend(
+    service: Option<&str>,
+    config: &gaze_core::config::Config,
+) -> Option<gaze_security::keyring::Backend> {
+    use gaze_security::keyring::Backend;
+    if service == Some(FACE_PAM_SERVICE) && config.storage.unlock_gnome_keyring {
+        Some(Backend::Gnome)
+    } else if is_kwallet_login(service) && config.storage.unlock_kwallet {
+        Some(Backend::KWallet)
+    } else {
+        None
+    }
 }
 
 fn finish_keyring<F>(
@@ -323,10 +365,7 @@ fn finish_keyring<F>(
 where
     F: FnOnce() -> Result<(), ()>,
 {
-    if authenticated != PAM_SUCCESS
-        || service != Some(FACE_PAM_SERVICE)
-        || !config.storage.unlock_gnome_keyring
-    {
+    if authenticated != PAM_SUCCESS || keyring_backend(service, config).is_none() {
         return authenticated;
     }
     if config.storage.validate_keyring(&config.liveness).is_err() || supply().is_err() {
@@ -335,7 +374,11 @@ where
     PAM_SUCCESS
 }
 
-unsafe fn supply_keyring_token(pamh: PamHandle, username: &str) -> Result<(), ()> {
+unsafe fn supply_keyring_token(
+    pamh: PamHandle,
+    username: &str,
+    backend: gaze_security::keyring::Backend,
+) -> Result<(), ()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(());
     }
@@ -349,7 +392,7 @@ unsafe fn supply_keyring_token(pamh: PamHandle, username: &str) -> Result<(), ()
     }
     // An unenrolled user has nothing to unlock: leave the keyring locked as before rather
     // than failing the face login for everyone who has not run `gaze keyring`.
-    let Some(secret) = gaze_security::keyring::load(username).map_err(|_| ())? else {
+    let Some(secret) = gaze_security::keyring::load_for(backend, username).map_err(|_| ())? else {
         return Ok(());
     };
     // Linux-PAM copies the token; our zeroizing buffer is dropped immediately afterwards.
@@ -469,10 +512,18 @@ fn wait_for_prompt_finish_within(state: &SharedAuthState, deadline: Duration) ->
     shared_state.finished
 }
 
+const TTY_CONVERSATION_SERVICES: [&str; 6] = ["sudo", "sudo-i", "su", "su-l", "doas", "login"];
+
 /// Whether a prompt started now could be unblocked again, rather than parking a thread inside
-/// the caller's conversation with no way back out.
-fn prompt_is_retirable() -> bool {
-    has_interactive_tty()
+/// the caller's conversation with no way back out. An open `/dev/tty` is not enough: a locker
+/// launched from a shell has one, but its conversation waits on a condition variable that
+/// neither an injected newline nor EINTR can end.
+fn prompt_is_retirable(service: Option<&str>) -> bool {
+    service_reads_the_tty(service) && has_interactive_tty()
+}
+
+fn service_reads_the_tty(service: Option<&str>) -> bool {
+    service.is_some_and(|s| TTY_CONVERSATION_SERVICES.contains(&s))
 }
 
 fn prompt_is_finished(state: &SharedAuthState) -> bool {
@@ -582,9 +633,9 @@ unsafe fn do_authenticate_simultaneous(
 
     let is_polkit = matches!(service, Some(ref s) if s == "polkit-1");
 
-    // Without a terminal a prompt can only be retired by signalling, and graphical conversations
-    // resume their own read on EINTR. Polkit is exempt: it consumes the prompt for confirmation.
-    if !prompt_is_retirable() && !is_polkit {
+    // Only a terminal conversation can be retired; any other one would resume its wait after
+    // every signal. Polkit is exempt: it consumes the prompt for confirmation.
+    if !prompt_is_retirable(service.as_deref()) && !is_polkit {
         let bio = rt.block_on(authenticate_biometric_with_timeout(
             &username,
             service.as_deref(),
@@ -674,6 +725,28 @@ pub unsafe fn do_authenticate(pamh: PamHandle, flags: c_int, options: PamOptions
     if caller_is_remote(unsafe { get_pam_rhost(pamh) }.as_deref()) {
         return PAM_IGNORE;
     }
+    // The managed login entry owns the scan. Shared distro stacks may contain another
+    // Gaze entry (including simultaneous/retry); reaching it on fallback must not scan again.
+    if is_kwallet_login(unsafe { get_pam_service(pamh) }.as_deref()) {
+        let mut attempted = std::ptr::null();
+        if unsafe { pam_get_data(pamh, c"gaze_kde_login_attempted".as_ptr(), &mut attempted) }
+            == PAM_SUCCESS
+        {
+            return PAM_IGNORE;
+        }
+        if options.kde_login
+            && unsafe {
+                pam_set_data(
+                    pamh,
+                    c"gaze_kde_login_attempted".as_ptr(),
+                    c"attempted".as_ptr().cast_mut().cast(),
+                    None,
+                )
+            } != PAM_SUCCESS
+        {
+            return PAM_AUTHINFO_UNAVAIL;
+        }
+    }
     match options.mode {
         PamMode::Sequential | PamMode::Retry => unsafe {
             do_authenticate_sequential(pamh, flags, options)
@@ -744,6 +817,72 @@ mod tests {
                 PAM_SUCCESS
             );
         }
+    }
+
+    #[test]
+    fn kwallet_release_is_limited_to_successful_enabled_kde_logins() {
+        let mut config = keyring_config();
+        config.storage.unlock_gnome_keyring = false;
+        config.storage.unlock_kwallet = true;
+        for service in ["sddm", "plasmalogin", "plasmalogin-fingerprint"] {
+            for failure in [
+                PAM_AUTH_ERR,
+                PAM_AUTHINFO_UNAVAIL,
+                PAM_IGNORE,
+                PAM_SERVICE_ERR,
+            ] {
+                assert_eq!(
+                    finish_keyring(failure, Some(service), &config, || panic!(
+                        "failed authentication"
+                    )),
+                    failure
+                );
+            }
+            assert_eq!(
+                finish_keyring(PAM_SUCCESS, Some(service), &config, || Ok(())),
+                PAM_SUCCESS
+            );
+            assert_eq!(
+                finish_keyring(PAM_SUCCESS, Some(service), &config, || Err(())),
+                PAM_AUTHINFO_UNAVAIL
+            );
+            config.liveness.enabled = false;
+            assert_eq!(
+                finish_keyring(PAM_SUCCESS, Some(service), &config, || panic!(
+                    "no liveness"
+                )),
+                PAM_AUTHINFO_UNAVAIL
+            );
+            config.liveness.enabled = true;
+            config.storage.encrypt_templates = false;
+            assert_eq!(
+                finish_keyring(PAM_SUCCESS, Some(service), &config, || panic!("no TPM")),
+                PAM_AUTHINFO_UNAVAIL
+            );
+            config.storage.encrypt_templates = true;
+        }
+        for service in [
+            None,
+            Some("sudo"),
+            Some("polkit-1"),
+            Some("kde"),
+            Some("kde-fingerprint"),
+            Some("kde-smartcard"),
+            Some("gdm-face"),
+            Some("sddm-autologin"),
+            Some("login"),
+        ] {
+            assert_eq!(
+                finish_keyring(PAM_SUCCESS, service, &config, || panic!("not a KDE login")),
+                PAM_SUCCESS
+            );
+        }
+        config.storage.unlock_kwallet = false;
+        assert_eq!(
+            finish_keyring(PAM_SUCCESS, Some("sddm"), &config, || panic!("disabled")),
+            PAM_SUCCESS
+        );
+        assert!(parse_pam_options(["kde-login"]).kde_login);
     }
 
     #[test]
@@ -822,6 +961,16 @@ mod tests {
     }
 
     #[test]
+    fn only_terminal_conversations_are_retirable() {
+        for service in TTY_CONVERSATION_SERVICES {
+            assert!(service_reads_the_tty(Some(service)));
+        }
+        assert!(!service_reads_the_tty(Some("hyprlock")));
+        assert!(!service_reads_the_tty(Some("polkit-1")));
+        assert!(!service_reads_the_tty(None));
+    }
+
+    #[test]
     fn a_definitive_non_match_stands_the_retry_down() {
         assert!(!retry_is_warranted(Some(FirstPassVerdict::NoMatch)));
     }
@@ -894,18 +1043,21 @@ mod tests {
             parse_pam_options(Vec::<&str>::new()),
             PamOptions {
                 mode: PamMode::Sequential,
+                kde_login: false,
             }
         );
         assert_eq!(
             parse_pam_options(["simultaneous"]),
             PamOptions {
                 mode: PamMode::Simultaneous,
+                kde_login: false,
             }
         );
         assert_eq!(
             parse_pam_options(["other", "simultaneous"]),
             PamOptions {
                 mode: PamMode::Simultaneous,
+                kde_login: false,
             }
         );
     }

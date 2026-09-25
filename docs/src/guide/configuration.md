@@ -53,6 +53,7 @@ max_seconds = 2.0
 
 [storage]
 encrypt_templates = false
+unlock_kwallet = false # optional TPM-backed KDE wallet unlock
 unlock_gnome_keyring = false
 ```
 
@@ -165,22 +166,25 @@ The default camera source is:
 rgb = "primary"
 ```
 
-`primary` uses GStreamer `pipewiresrc`. To pin Gaze to a specific PipeWire camera, use `gaze config` or set `rgb` to a GStreamer source:
+`primary` resolves to the first color `/dev/video*` node. To pin Gaze to a specific PipeWire camera, use `gaze config` or set `rgb` to a GStreamer source:
 
 ```toml
 [cameras]
 rgb = "pipewiresrc target-object=<pipewire-target>"
 ```
 
-`pipewiresrc` needs a PipeWire session to attach to. GDM's greeter runs its own
-user session and provides one, but greeters like KDE's `plasmalogin`, SDDM,
-greetd, and a plain TTY do not. When the PipeWire source fails to open, Gaze logs
-`Opening the PipeWire camera failed` and falls back to the first matching V4L2
-node on its own, so `primary` still works in those greeters.
+For authentication and enrollment, the privileged daemon captures the backing
+kernel `/dev/video*` node directly with `v4l2src` and never connects to a
+user-session PipeWire socket: that socket — and every virtual camera it
+advertises — is controlled by the user being authenticated, so trusting it would
+let injected frames reach face authentication. A pinned PipeWire target is
+resolved to its own V4L2 node the same way, and a source with no kernel node
+(including a hand-written GStreamer pipeline) is refused. `primary` therefore
+works in greeters and on plain TTYs with no PipeWire session at all.
 
-Pinning `rgb` to the camera directly skips that fallback and uses `v4l2src`
-straight away. Prefer it when the machine has several cameras and you want a
-specific one, rather than as a workaround for a greeter without a session:
+Pinning `rgb` to the camera directly uses `v4l2src` straight away without
+resolving a PipeWire target first. Prefer it when the machine has several
+cameras and you want a specific one:
 
 ```toml
 [cameras]
@@ -246,7 +250,7 @@ parallel_capture = "auto"
 
 `auto` resolves each configured source to its `/dev/video*` node and compares the hardware function behind it (for USB cameras, the sysfs USB interface the node hangs off). Two nodes on the same function are substreams of one device that only streams one mode at a time, so they stay serial even though their node numbers differ. This is the BRIO case, where `/dev/video0` and `/dev/video2` share a single UVC function.
 
-The default `rgb = "primary"` names no node of its own: it means "whatever camera PipeWire hands out". Rather than guess which one that is, `auto` asks the question from the IR side: does the IR camera's own function also expose a colour node? If it does, the IR camera is a dual-sensor device that `primary` may well resolve to, so capture stays serial. If the IR function is infrared-only, it cannot be whatever `primary` turns out to be, and the two stream at once. A hand-written GStreamer pipeline in `rgb` is treated the same way. If nothing can be enumerated at all, `auto` keeps the serial path.
+The default `rgb = "primary"` means the first color `/dev/video*` node. Rather than guess which one that is, `auto` asks the question from the IR side: does the IR camera's own function also expose a colour node? If it does, the IR camera is a dual-sensor device that `primary` may well resolve to, so capture stays serial. If the IR function is infrared-only, it cannot be whatever `primary` turns out to be, and the two stream at once. An unresolvable `rgb` value is treated the same way. If nothing can be enumerated at all, `auto` keeps the serial path.
 
 Parallel capture only changes *when* each spectrum is captured, never whether both have to pass. `hybrid_policy` behaves identically in both modes. The speedup is also bounded by face detection, which both spectra share, so expect a real improvement rather than a halving.
 
@@ -280,7 +284,7 @@ start_delay_ms = 0
 start_delay_scope = "screen_lock"
 ```
 
-`abort_if_ssh` detects SSH sessions from the DBus caller process environment. `abort_if_lid_closed` reads ACPI lid state when available and is ignored on systems without a lid sensor.
+`abort_if_ssh` asks logind whether the D-Bus caller's session is remote, falling back to the caller process environment and ancestry where logind is unreachable. `abort_if_lid_closed` reads ACPI lid state when available and is ignored on systems without a lid sensor.
 
 Aborting face authentication when you type a password is not a key in this file. It is a property of the PAM stack: [simultaneous mode](/guide/pam#what-gaze-installs) (`pam_gaze.so simultaneous`) stands Gaze down as soon as you submit a password, and [retry mode](/guide/pam#retry-after-a-rejected-password) (`pam_gaze.so retry`) gives face auth one more attempt if that password turns out to be wrong.
 
@@ -295,7 +299,8 @@ When confirmation is disabled, a successful match replaces the camera prompt wit
 With the standard sequential `pam_gaze` mode (e.g. `sudo`, `gdm-face`):
 - In a text-based (TTY) environment such as `sudo` in a terminal, it asks for text confirmation after the face match ("Press Enter to confirm, Esc to cancel").
 - On the GNOME lock screen, GDM login screen, and unified Cinnamon lock screen (with the Gaze Extension active), it shows "Face Verified. Press Enter to confirm." below the password field (or presents a dedicated "Confirm Face Unlock" button); press Enter or click the button to confirm. If the extension is inactive, the login is denied, because the extension is the expected confirmation channel on GNOME and Gaze will not silently skip the confirmation you asked for.
-- In other graphical prompts without a TTY (e.g. the KDE lock screen, `hyprlock`, or Cinnamon running standalone `cinnamon-screensaver`), there is no channel that could answer the prompt, so the face match unlocks on its own. On the KDE lock screen in particular, asking would not reach anybody: the greeter never delivers a response to its biometric slot, so the request would hang that slot for the rest of the lock. If you want the confirmation step enforced on a surface that can show a dialog, use simultaneous mode (`pam_gaze.so simultaneous`).
+- Where there is no controlling terminal but the PAM conversation can still prompt (e.g. `hyprlock`), it asks "Face Verified. Type 'yes' to confirm." An empty answer never counts as consent there: hosts that answer unknown prompts with `""` would otherwise auto-confirm without the user doing anything.
+- On the KDE lock screen biometric slots (`kde-fingerprint`, `kde-smartcard`) and the `plasmalogin-fingerprint` greeter helper, there is no channel that could answer at all, so the face match unlocks on its own and `require_confirmation_lock_screen` is silently ignored there by design. Asking would not reach anybody: the greeter never delivers a response to a noninteractive slot, so the request would hang that slot for the rest of the lock. `gaze doctor` warns when the toggle is on and one of those slots is wired. If you want the confirmation step enforced on a surface that can show a dialog, use simultaneous mode (`pam_gaze.so simultaneous`).
 - A **login greeter** is the exception: it never bypasses. GDM always runs GNOME with the Gaze Extension, so confirmation is enforced there or the login is denied.
 
 A "text-based (TTY) environment" means Gaze can open the process's controlling terminal (`/dev/tty`), which is how `sudo` itself finds the terminal to prompt on. Redirected standard input does not change that, so `echo 1 | sudo tee /tmp/1` still confirms from the keyboard. When there is no controlling terminal at all (a management console such as Cockpit that drives PAM over a framed stdio protocol, or a service started without one), nobody can press a key, so Gaze neither prints a terminal banner nor waits for one; the face match is refused and the stack falls through to the password.
@@ -419,6 +424,14 @@ skip it keep logging in with face and are prompted for the keyring as before.
 Read the security notes in
 [GNOME Keyring setup](/guide/gnome#optional-tpm-backed-keyring-unlock) first:
 the stored password is recoverable by root on this machine.
+
+## Unlock KWallet after a KDE face login
+
+`storage.unlock_kwallet` also defaults to `false` and requires both TPM template
+encryption and liveness. Enable it for KDE login wallet unlock, then run
+`gaze keyring --kwallet` and `sudo gaze-kde-pam enable-login`. Its credential is
+independent of GNOME Keyring. See [KWallet setup](/guide/kde#optional-tpm-backed-kwallet-unlock)
+for supported login services, PAM setup, and re-enrollment requirements.
 
 ## Enrollment behavior
 
